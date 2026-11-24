@@ -1,5 +1,10 @@
 """
-trade_tracker.py - Entry / Exit / LTP / Captured Points / P&L for the AlgoDelta orders table.
+trade_tracker.py - Entry / Exit / LTP / Captured Points / P&L for the orders table.
+
+Broker rows (BEP Upstox PR 3, a "bk" position, see positions.py): Entry / Exit / quantity come from the position
+              (the broker's fills, or the paper broker in Dry run); only their CANDLE SL / Target rules are
+              checked here (custom_hit -> the engine asks the position to exit). The text below is about the
+              rows of the old AlgoDelta path (kept for old orders files).
 
 SENT rows:    entry and exit are the real fills from today's Upstox trade book
               (GET /v2/order/trades/get-trades-for-day), matched by the option's instrument key. When several
@@ -67,6 +72,18 @@ def entry_time(r) -> str:
     return (m.get("fill_time") if m else None) or r.get("time", "")
 
 
+def _bk(r):
+    """The row's broker position state (BEP Upstox PR 3), or None."""
+    v = r.get("_bk")
+    if v:
+        return v
+    try:
+        v = json.loads(r.get("bk") or "null")
+    except (TypeError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
 def _opt_key(r):
     try:
         return r.get("index"), int(float(r.get("strike"))), r.get("opt")
@@ -125,6 +142,22 @@ def compute(client, rows, expiry_by_index, trades=None, now=None, known=None):
             ltp = ltp_map.get(ik.replace("|", ":"))
         fields = {"ltp_live": round(ltp, 2) if ltp is not None else _keep(r, "ltp_live")}
 
+        b = _bk(r)
+        if b:                                         # broker position (positions.py): Entry / Exit come from it
+            entry, exit_ = _f(b.get("fill")), _f(b.get("exit"))
+            qty_units = _f(b.get("fill_qty")) or _f(b.get("units"))
+            rules = [x for x in custom_rules(r) if x.get("type") == "CANDLE"]   # LTP / POINT: the position does it
+            if rules and exit_ is None and entry is not None and not r.get("c_done") and ik \
+                    and not b.get("exit_req"):
+                candles, _cerr = client.fetch_intraday_candles(ik, 1)
+                hit = exit_rules.evaluate(entry, (b.get("fill_time") or r.get("time", ""))[:8], candles or [],
+                                          rules, now or datetime.now(market_utils.IST), eod=False)
+                if hit:
+                    fields["custom_hit"] = hit
+            fields["filled_qty"] = int(b["fill_qty"]) if b.get("fill_qty") else ""
+            fields.update(_points(entry, exit_, ltp, qty_units))
+            out[r["id"]] = fields
+            continue
         m = limit_orders.parse(r.get("mg"))
         if r["status"] == "DRY RUN":
             entry = _f(r.get("ltp")) if m is None else (_f(m.get("fill")) if limit_orders.held(m) else None)

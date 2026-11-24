@@ -6,6 +6,7 @@ Upstox v3 order API (https://upstox.com/developer/api-documentation/v3/place-ord
   modify  PUT    {order host}/v3/order/modify          (validity, price, order_type, trigger_price required)
   cancel  DELETE {order host}/v3/order/cancel?order_id=
   status  GET    https://api.upstox.com/v2/order/details?order_id=   (live only; not in the sandbox)
+  book    GET    https://api.upstox.com/v2/order/retrieve-all         (live only; all of today's orders)
   exit    POST   https://api.upstox.com/v2/order/positions/exit?tag=  (intraday positions of that tag; live only)
 
 Live: order host https://api-hft.upstox.com, the daily access token, and the static IP registered in the user's
@@ -67,7 +68,7 @@ class UpstoxBroker:
         self._known = {}            # order_id -> last known fields (modify needs them; the sandbox has no status)
         caps = {base.CAP_MODIFY, base.CAP_CANCEL_BY_ID, base.CAP_STOP_MARKET}
         if not self.sandbox:
-            caps |= {base.CAP_STATUS, base.CAP_EXIT_BY_TAG}
+            caps |= {base.CAP_STATUS, base.CAP_EXIT_BY_TAG, base.CAP_ORDER_BOOK}
         self.capabilities = frozenset(caps)
 
     # ------------------------------------------------------------------ http
@@ -211,6 +212,19 @@ class UpstoxBroker:
                                                  params={"order_id": order_id}, retry=True)
         if not ok or not isinstance(d, dict):
             return base.OrderStatus(order_id, base.UNKNOWN, message=msg or "no data", raw=raw)
+        return self._to_status(d, order_id)
+
+    def order_book(self):
+        """[OrderStatus] of today's orders (one call), or None when not offered / not readable."""
+        if base.CAP_ORDER_BOOK not in self.capabilities:
+            return None
+        ok, data, code, msg, raw, _unc = self._call("GET", f"{LIVE_HOST}/v2/order/retrieve-all", retry=True)
+        if not ok or not isinstance(data, list):
+            return None
+        return [self._to_status(d) for d in data if isinstance(d, dict) and d.get("order_id")]
+
+    @staticmethod
+    def _to_status(d, order_id=""):
         return base.OrderStatus(
             order_id=str(d.get("order_id") or order_id), status=map_status(d.get("status")),
             order_type=d.get("order_type") or "", side=d.get("transaction_type") or "",

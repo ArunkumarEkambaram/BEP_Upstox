@@ -24,7 +24,7 @@ INDEXES = {
 STRIKE_INTERVAL = 50        
 STRIKES_EACH_SIDE = 2       # nearest strike +/- 2 -> 5 strikes total
 
-# Upstox trade book refresh for the AlgoDelta orders table (Entry / Exit of SENT orders).
+# Upstox trade book refresh (old orders rows without a broker position).
 TRADES_REFRESH_SECONDS = 30
 OPTION_LTP_SECONDS = 2                 # live LTP on the Order Management cards (one batched call)
 
@@ -51,10 +51,9 @@ TRACK_GIVE_UP_SECONDS = 180
 # Upstox
 UPSTOX_ACCESS_TOKEN = ""   # paste a pre-generated access token
 
-# Broker orders (BEP Upstox PR 2, brokers/). Mode "dry" (nothing sent) / "sandbox" (api-sandbox.upstox.com, the
-# 30-day sandbox token) / "live" (needs the static IP registered in the user's Upstox app). The mode is NOT saved:
-# the app always starts in "dry". Until PR 3 only the Setup "Test order" panel uses it; the engine's orders still
-# go through the inherited AlgoDelta code (order_bridge.py).
+# Broker orders (brokers/, positions.py). Mode "dry" (paper broker, nothing sent) / "sandbox" (api-sandbox.upstox.com,
+# the 30-day sandbox token) / "live" (needs the static IP registered in the user's Upstox app). The mode is NOT
+# saved: the app always starts in "dry".
 BROKER_MODE = "dry"
 BROKER = {
     "broker": "upstox",          # the only adapter for now (brokers.BROKERS)
@@ -89,53 +88,26 @@ BEP_CROSS_TOUCH_CANDLES = 3       # the touch must be on the signal candle or th
 BEP_CROSS_WATCH_CANDLES = 6       # watched for 6 candles (30 min) after the signal: HELD or FAILED
 BEP_CROSS_ADD_PAIR = True         # a live signal also adds a TRIGGERED Pair row to Order Management (buffer 0)
 
-# ---------------------------------------------------------------- ALGO DELTA ORDERS
-AUTO_ORDER_DRY_RUN = True         # "Dry run" checkbox. True = log the JSON only, send nothing.
+# ---------------------------------------------------------------- ORDERS (broker layer, BEP Upstox PR 3)
+AUTO_ORDER_DRY_RUN = True         # True while the order mode is "dry" (set with BROKER_MODE; the app starts there)
 AUTO_ORDER_PAUSED = False         # "Pause algo trade" button.
-AUTO_ORDER_DAILY_LIMIT = 5       # "Max orders/day" box: hard cap on LIVE orders per day.
+AUTO_ORDER_DAILY_LIMIT = 5       # "Max orders/day" box: hard cap on Sandbox / Live entry orders per day.
+AUTO_ORDER_SL_LIMIT_GAP = 5      # exchange SL: if Upstox rejects SL-M, an SL limit at trigger - this many points
+EOD_EXIT_TIME = "15:15"          # open positions are closed (SL order -> MARKET) and unfilled entries cancelled
 
-# Per-index AlgoDelta settings. 
-# "tgt_type", "sl_type" and "trail_type" can be "POINT" or "LTP".
-# The UI controls always decide exit_on_opposite, is_trail_set and the trail_* values
-# (order_bridge.build_payload writes them over whatever the JSON template holds).
-import copy as _copy
-
-_STRATEGY_ORDER = {
-    "type": "strategy_order",
-    "exit_on_opposite": "{exit_on_opposite}",
-    "is_tgt": True,
-    "is_sl": True,
-    "is_trail_set": "{is_trail}",
-    "position_size": "{{strategy.position_size}}",
-    "transaction_type": "BUY",
-    "script_type": "{opt}",
-    "is_rollover": False,
-    "option_selection": "SYMBOL_BASED",
-    "script": "{symbol}",
-    "product": "INTRADAY",
-    "quantity": "{qty}",
-    "signal_type": "{signal}",
-    "trail_type": "{trail_type}",
-    "trail_trigger": "{trail_trigger}",
-    "trail_gap": "{trail_gap}",
-    "trail_point": "{trail_point}",
-    "tgt_type": "{tgt_type}",
-    "tgt_value": "{tgt}",
-    "sl_type": "{sl_type}",
-    "sl_value": "{sl}",
-}
-
+# Per-index order defaults (Setup > Order defaults). "tgt_type" / "sl_type" can be "POINT" or "LTP".
 def _default_auto_order() -> dict:
     return {
-        "webhook_url": "", "confirmed": False,
         "tgt": 50, "sl": 12, "tgt_type": "POINT", "sl_type": "POINT", "qty": 1,
-        "exit_on_opposite": False,
         "max_above_bep": 15,          # 09:15 order is skipped when LTP - BEP >= this many points
         # 09:15 order (PR #41): enters at LTP >= BEP + open_entry_above; its SL is a CANDLE close below
-        # BEP - open_sl_below on open_sl_tf-minute candles, watched by the app (AlgoDelta gets is_sl false)
+        # BEP - open_sl_below on open_sl_tf-minute candles, watched by the app
         "open_entry_above": 2, "open_sl_below": 2, "open_sl_tf": 5,
-        # PR #47: a hard max SL held by AlgoDelta (POINT, from its fill) on top of the app CANDLE SL; 0 = none
+        # PR #47: a hard max SL at the exchange (POINT, from the fill) on top of the app CANDLE SL; 0 = none
         "open_max_sl": 17,
+        # BEP Upstox PR 3: a card whose SL is CANDLE only also gets an exchange SL this many points below the
+        # fill (a fall inside a candle, or the app down); 0 = none
+        "candle_max_sl": 17,
         # ⚡ on a BEP card (⭐ / BEP cross Pair / Manual Entry): "Check before placing" when the LTP (or the limit
         # price) is more than this many points above the strike's BEP (PR #43; 0 = off)
         "warn_above_bep": 10,
@@ -143,7 +115,6 @@ def _default_auto_order() -> dict:
         # each row can override value and type until it is ordered
         "tgt_same": 50, "tgt_pair": 50, "tgt_star": 50, "tgt_manual": 50,
         "trail": False, "trail_type": "LTP", "trail_trigger": 20, "trail_point": 1, "trail_gap": 19,
-        "templates": {"strategy_order": _copy.deepcopy(_STRATEGY_ORDER)},
     }
 
 AUTO_ORDER = {name: _default_auto_order() for name in INDEXES}

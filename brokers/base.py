@@ -31,6 +31,7 @@ FINAL = (COMPLETE, CANCELLED, REJECTED)
 CAP_MODIFY = "modify"                 # modify price / trigger / type of an open order by its ID
 CAP_CANCEL_BY_ID = "cancel_by_id"     # cancel one order by its ID
 CAP_STATUS = "status"                 # read one order's status by its ID
+CAP_ORDER_BOOK = "order_book"         # read all of today's orders in one call
 CAP_EXIT_BY_TAG = "exit_by_tag"       # exit the intraday position opened by orders with one tag
 CAP_STOP_MARKET = "stop_market"       # SL-M orders
 CAP_GTT = "gtt"                       # broker-held entry + target + SL (not used yet)
@@ -109,6 +110,8 @@ class Broker(Protocol):
     def cancel(self, order_id: str) -> OrderResult: ...
 
     def status(self, order_id: str) -> OrderStatus: ...
+
+    def order_book(self) -> Optional[list]: ...          # [OrderStatus] of today's orders, None when not offered
 
     def exit_by_tag(self, tag: str) -> OrderResult: ...
 

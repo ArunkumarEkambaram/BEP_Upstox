@@ -1,10 +1,10 @@
 """
 settings_store.py - keeps the "once a day" settings in settings.json next to the app, so a restart does
-not ask for them again: strike count, scan interval, max orders/day and each index's AlgoDelta settings
-(webhook URL, JSON template, target / SL / trail, quantity, max points above BEP, exit on opposite).
+not ask for them again: strike count, scan interval, max orders/day and each index's order defaults
+(target / SL / trail, quantity, per-type targets, 09:15 values, max SL for candle-SL cards).
 
 The Upstox token is saved separately in upstox_token.json with today's date and is only reused on that same
-date (Upstox tokens expire daily). Deliberately NOT saved: Dry run (the app always starts in Dry run),
+date (Upstox tokens expire daily). Deliberately NOT saved: the order mode (the app always starts in Dry run),
 Pause alerts and Pause algo trade. settings.json and upstox_token.json are in .gitignore.
 Broker orders (PR 2): Market protection and Algo name are saved in settings.json ("broker"); the broker mode is not
 (the app starts in Dry run). The 30-day Upstox sandbox token is kept in sandbox_token.json (also git-ignored).
@@ -18,8 +18,8 @@ PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upstox_token.json")
 SANDBOX_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_token.json")
 _BROKER_KEYS = ("market_protection", "algo_name")
-_AUTO_KEYS = ("webhook_url", "confirmed", "tgt", "sl", "tgt_type", "sl_type", "qty", "exit_on_opposite", "trail",
-              "trail_type", "trail_trigger", "trail_point", "trail_gap", "max_above_bep", "templates",
+_AUTO_KEYS = ("tgt", "sl", "tgt_type", "sl_type", "qty", "trail", "candle_max_sl",
+              "trail_type", "trail_trigger", "trail_point", "trail_gap", "max_above_bep",
               "tgt_same", "tgt_pair", "tgt_star", "tgt_manual", "open_entry_above", "open_sl_below", "open_sl_tf", "open_max_sl",
               "warn_above_bep")
 
