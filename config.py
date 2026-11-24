@@ -2,6 +2,11 @@
 config.py — central configuration for the BEP Support monitor.
 """
 
+# App identity (BEP Upstox, PR 1). It runs next to the BEP AlgoDelta app (port 8083) on its own port; each app
+# keeps its own settings.json, upstox_token.json, orders_*.csv and common_watch_*.json in its own folder.
+APP_NAME = "BEP Upstox"
+APP_PORT = 8084
+
 # Nifty index instrument key (spot LTP)
 NIFTY_INDEX_KEY = "NSE_INDEX|Nifty 50"
 

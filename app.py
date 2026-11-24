@@ -179,7 +179,7 @@ def root():
 
     with ui.header().classes("items-center gap-3 px-4 py-2 bg-[#0f172a] text-white border-b border-slate-800"):
         ui.button(icon="menu", on_click=lambda: drawer.toggle()).props("flat round color=white dense")
-        ui.label("BEP AlgoDelta").classes("text-lg font-bold tracking-wide")
+        ui.label(config.APP_NAME).classes("text-lg font-bold tracking-wide")
         ltp_lbl = ui.label("").classes("text-sm bg-slate-800 rounded px-2 py-1")
         status_lbl = ui.label("").classes("text-sm opacity-80")
         ui.space()
@@ -2599,4 +2599,4 @@ engine.scan_timer = app.timer(config.SCAN_INTERVAL_SECONDS, engine.scan)
 app.timer(config.OPENING_TICK_SECONDS, engine.opening)
 app.timer(config.OPTION_LTP_SECONDS, engine.option_tick)
 
-ui.run(title="BEP AlgoDelta", port=8083, reload=False, dark=True)
+ui.run(title=config.APP_NAME, port=config.APP_PORT, reload=False, dark=True)
