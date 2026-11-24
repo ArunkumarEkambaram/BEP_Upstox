@@ -2,7 +2,8 @@
 engine.py - the app's single background engine.
 
 Everything that is not drawing the screen lives here: the Upstox connection, the BEP Support scan, the 09:15
-opening order, Order Management (common price + ⭐ rows), AlgoDelta orders and their Entry / Exit tracking, the log and the alerts.
+opening order, Order Management (common price + ⭐ rows), the broker orders (brokers/, positions.py: entry, exchange SL,
+trailing, exits) and their Entry / Exit tracking, the log and the alerts.
 It runs ONCE for the whole app (app.timer in app.py), however many browser tabs are open. The pages only read
 its state; each change bumps a version number so a page knows when to redraw. Alerts are queued as events that
 every open tab shows once.
@@ -21,7 +22,7 @@ import exit_rules
 import limit_orders
 import market_utils
 import notifier
-import order_bridge
+import positions
 import replay
 import settings_store
 import trade_tracker
@@ -32,8 +33,10 @@ from common_watch import CommonWatch  # noqa: F401  (also used for pair titles)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ORDER_FILE_COLUMNS = ["id", "time", "index", "opt", "strike", "kind", "bep", "ltp", "status", "detail", "payload",
-                      "expiry", "qty", "exit", "exit_time", "exit_reason", "c_sl", "c_tgt", "c_done", "sq", "mg", "c_trail"]
+                      "expiry", "qty", "exit", "exit_time", "exit_reason", "c_sl", "c_tgt", "c_done", "sq", "mg", "c_trail",
+                      "bk", "ik", "filled_qty"]
 ORDER_LOCKED = ("SENT", "DRY RUN", "sending")
+LIMIT_ORDERS_READY = False        # BEP Upstox: Limit / Stop-limit move to the broker layer in PR 4
 ORDER_STATUS = {"dry_run": "DRY RUN", "sent": "SENT", "failed": "FAILED", "blocked": "BLOCKED"}
 _LOCKING_STATUS = {"SENT": "sent", "DRY RUN": "dry_run", "FAILED": "failed"}
 
@@ -49,7 +52,7 @@ def _stamp():
 class Engine:
     def __init__(self):
         self.settings_status = settings_store.load()
-        config.AUTO_ORDER_DRY_RUN = True                     # always start in Dry run
+        config.AUTO_ORDER_DRY_RUN = True                     # always start in Dry run (= broker mode "dry")
         self.client = upstox_client.UpstoxClient(config.UPSTOX_ACCESS_TOKEN)
         self.monitors = {n: BepMonitor(n) for n in config.INDEXES}
         self.replays = {}                                   # index -> replay BepMonitor (BEP Support "Replay")
@@ -82,6 +85,8 @@ class Engine:
         self.sandbox_token, self.sandbox_saved = settings_store.load_sandbox_token()
         self.broker = self._make_broker()
         self.test_orders = []                                # Setup "Test order" panel (newest first)
+        self._bk_busy = False
+        self._tag_seq = 0
         self.order_log = self._load_orders_today()
         self._restore_side_locks()
         self.log(f"App started. {self.settings_status} Dry run is ON.")
@@ -134,6 +139,7 @@ class Engine:
             r.setdefault("sq", "")
             r.setdefault("mg", "")
             r.setdefault("c_trail", "")
+            r.setdefault("bk", "")
         return rows
 
     def _restore_side_locks(self):
@@ -172,8 +178,10 @@ class Engine:
                 w.writeheader()
                 for r in self.order_log:
                     row = {k: r.get(k, "") for k in ORDER_FILE_COLUMNS}
-                    if r.get("status") != "DRY RUN":       # live exits always come from Upstox
+                    if r.get("status") != "DRY RUN" and not r.get("bk"):   # (old AlgoDelta rows: from Upstox)
                         row.update(exit="", exit_time="", exit_reason="")
+                    if r.get("_bk"):
+                        row["bk"] = json.dumps(r["_bk"])
                     w.writerow(row)
             os.replace(tmp, path)
         except OSError as ex:
@@ -192,7 +200,13 @@ class Engine:
             "c_sl": (sig.get("app_rules") or {}).get("c_sl", ""), "c_tgt": (sig.get("app_rules") or {}).get("c_tgt", ""),
             "c_done": "", "sq": "", "mg": sig.get("mg", ""),
             "c_trail": (sig.get("app_rules") or {}).get("c_trail", ""),
+            "bk": json.dumps(res["bk"]) if res.get("bk") else "", "ik": (res.get("bk") or {}).get("ik", ""),
+            "filled_qty": "",
         }
+        if res.get("bk"):
+            row["_bk"] = res["bk"]
+            if res["bk"].get("fill") is not None:          # sandbox: assumed filled when sent
+                row["entry"] = res["bk"]["fill"]
         self.order_log.append(row)
         self._save_order_row(row)
         self.bump("orders")
@@ -305,17 +319,11 @@ class Engine:
                  else "Algo trade RESUMED: entry orders allowed again.")
         self.bump("settings")
 
-    def set_dry_run(self, on: bool):
-        config.AUTO_ORDER_DRY_RUN = bool(on)
-        self.log("Dry run ON - orders are only logged." if on else "Dry run OFF - orders are LIVE.")
-        self.bump("settings")
-
-    def save_auto_order(self, name, template: dict, nums: dict, url: str, confirmed: bool) -> str:
-        cfg = config.AUTO_ORDER[name]
-        cfg["templates"]["strategy_order"] = template
-        cfg.update(webhook_url=url, confirmed=bool(confirmed), **nums)
+    def save_order_defaults(self, name, nums: dict) -> str:
+        """Setup > Order defaults (quantity, Target / SL / trail, per-type targets, 09:15 values, max SL)."""
+        config.AUTO_ORDER[name].update(**nums)
         saved = settings_store.save()
-        self.log(f"{name} AlgoDelta settings saved. {saved}")
+        self.log(f"{name} order defaults saved. {saved}")
         self.bump("settings")
         return saved
 
@@ -332,9 +340,12 @@ class Engine:
         if mode not in brokers.MODES:
             return
         config.BROKER_MODE = mode
+        config.AUTO_ORDER_DRY_RUN = mode == "dry"
         self.broker = self._make_broker()
-        self.log(f"Broker orders: {brokers.MODE_LABELS[mode]} ({self.broker.name}"
-                 + (", sandbox" if mode == "sandbox" else "") + "). Engine orders still use AlgoDelta until PR 3.")
+        self.log(f"Order mode: {brokers.MODE_LABELS[mode]} ({self.broker.name}"
+                 + (", sandbox" if mode == "sandbox" else "") + ")."
+                 + (" Orders placed in another mode keep their state but are not managed now." if any(
+                     self._bk(o) and not self._bk(o).get("closed") for o in self.order_log) else ""))
         self.bump("broker", "settings")
 
     def save_broker_settings(self, market_protection: int, algo_name: str) -> str:
@@ -845,6 +856,7 @@ class Engine:
             await self.check_pending_entries()
             await self.check_limits()
             await self.check_app_trails()
+            await self.broker_tick()
 
     async def place_watch_order(self, name, row_id, fill_ltp=None, entry_note=""):
         """Sends the card's order now (market). Signal LTP = the live LTP at the click / at the price hit (dry-run
@@ -874,16 +886,16 @@ class Engine:
             rule = exit_rules.parse(r.get("c_" + k))
             if not rule:
                 continue
-            if exit_rules.is_none(rule):              # Target None (PR #48): AlgoDelta holds no target
+            if exit_rules.is_none(rule):              # Target None (PR #48): no target
                 params["is_" + k] = False
                 continue
-            if rule["type"] == "CANDLE":              # watched by the app -> AlgoDelta must not hold its own
+            if rule["type"] == "CANDLE":              # watched by the app on candle closes (+ max SL at the exchange)
                 params["is_" + k] = False
                 app_rules["c_" + k] = json.dumps({**rule, "set_at": ""})
-            else:                                     # LTP / POINT -> sent to AlgoDelta as this order's value
+            else:                                     # LTP / POINT -> the exchange SL / the app target (positions.py)
                 params[k], params[k + "_type"] = rule["value"], rule["type"]
         sl_rule = exit_rules.parse(r.get("c_sl"))
-        if sl_rule and sl_rule["type"] == "CANDLE" and tr["on"]:   # AlgoDelta cannot trail (is_sl false): the app does
+        if sl_rule and sl_rule["type"] == "CANDLE" and tr["on"]:   # trail kept as c_trail; positions.py moves the SL
             app_rules["c_trail"] = self._trail_json(tr)
         sig = {"index": name, "opt": r["opt"], "strike": r["strike"],
                "bep": (r.get("entry_price") or ltp) if kind == "manual" else r["price"],
@@ -894,7 +906,7 @@ class Engine:
         r["pending"] = None
         cw.set_order_status(row_id, "sending")
         self.bump("watch")
-        res = await run.io_bound(order_bridge.send_order, sig)
+        res = await self.place_entry(sig)
         cw.set_order_status(row_id, ORDER_STATUS.get(res["status"], res["status"]))
         self.log(res["message"])
         self.add_order_row(sig, res)
@@ -904,8 +916,8 @@ class Engine:
         return res
 
     async def handle_pair_exits(self, name):
-        """Opponent SL of a pair: live -> AlgoDelta squareoff_position; dry run -> record the exit at the bought
-        leg's close. Skipped if the order already has an exit (target / SL / trail hit first)."""
+        """Opponent SL of a pair: the order exits through its position (exchange SL -> MARKET, next 2 s tick).
+        Skipped if the order already has an exit (target / SL / trail hit first)."""
         cw, mon = self.watches[name], self.monitors[name]
         for ev in cw.pop_exits():
             row = next((o for o in self.order_log if o["id"] == ev.get("order_id")), None)
@@ -929,22 +941,14 @@ class Engine:
             elif already:
                 self.log(f"Pair {CommonWatch.pair_title(ev)}: {why}, but the order had already exited - nothing to do.")
                 status = "not needed"
-            elif row.get("status") == "DRY RUN":
-                row.update(exit=round(ev["exit_close"], 2), exit_time=ev["fail_time"], exit_reason="Opponent SL",
-                           detail=f"{row.get('detail', '')} | Exit: Opponent SL {ev['fail_time']}".strip(" |"))
-                res = order_bridge.send_squareoff(name, ev["opt"], ev["strike"], mon.expiry, why)
-                self.log(res["message"])
-                self.log(f"DRY RUN pair exit {ev['opt']} {ev['strike']} at {ev['exit_close']:.2f} ({why}).")
-                self._rewrite_orders_file()
-                status = "DRY RUN"
-            elif row.get("status") == "SENT":
-                res = await run.io_bound(order_bridge.send_squareoff, name, ev["opt"], ev["strike"], mon.expiry, why)
-                self.log(res["message"])
-                self.notify(res["message"][:160], "warning" if res["status"] == "sent" else "negative",
-                            f"{name} square-off {ev['strike']}{ev['opt']}")
-                row["detail"] = f"{row.get('detail', '')} | Square-off {res['status'].upper()} {_stamp()}".strip(" |")
-                self._rewrite_orders_file()
-                status = res["status"].upper()
+            elif self._bk(row):
+                ok = self._request_exit(row, "Opponent SL")
+                status = "EXIT REQUESTED" if ok else "not needed"
+                self.log(f"Pair {CommonWatch.pair_title(ev)}: {why} - " + (
+                    "exit requested (the exchange SL becomes MARKET)." if ok else "nothing to do."))
+                if ok:
+                    self.notify(f"{name} {ev['strike']}{ev['opt']}: opponent SL - exiting", "warning",
+                                f"{name} exit {ev['strike']}{ev['opt']}")
             else:
                 status = "not needed"
             live = cw.get(ev["id"])
@@ -1043,7 +1047,7 @@ class Engine:
     async def dispatch_orders(self, name):
         mon = self.monitors[name]
         for sig in mon.pop_order_signals():
-            res = await run.io_bound(order_bridge.send_order, sig)
+            res = await self.place_entry(sig)
             mon.record_order_result(sig, res["status"])
             self.log(res["message"])
             self.add_order_row(sig, res)
@@ -1156,7 +1160,7 @@ class Engine:
             return
         trades = None
         now_ts = datetime.now().timestamp()
-        if any(r.get("status") == "SENT" for r in self.order_log) and \
+        if any(r.get("status") == "SENT" and not r.get("bk") for r in self.order_log) and \
                 now_ts - self._trades_at >= config.TRADES_REFRESH_SECONDS:
             trades, t_err = await run.io_bound(self.client.fetch_trades_for_day)
             self._trades_at = now_ts
@@ -1175,7 +1179,8 @@ class Engine:
                 if r["id"] in updates:
                     u = updates[r["id"]]
                     hit = u.pop("custom_hit", None)
-                    if hit and r.get("status") == "SENT" and not r.get("c_done") and not self.squared_off(r):
+                    if hit and (r.get("status") == "SENT" or self._bk(r)) and not r.get("c_done") \
+                            and not self.squared_off(r):
                         custom_exits.append((r, hit))
                     if u.pop("exit_new", False):
                         u["detail"] = f"{r.get('detail', '')} | Exit: {u['exit_reason']} {u['exit_time']}".strip(" |")
@@ -1185,18 +1190,193 @@ class Engine:
                 self.log(f"DRY RUN {r['index']} {r['opt']} {r['strike']}: simulated exit {r['exit_reason']} at "
                          f"{r['exit_time']}, price {r['exit']} -> {r['points']} points, P&L {r['pnl']}")
             for r, (price, at, reason) in custom_exits:
-                mon = self.monitors.get(r["index"])
-                res = await run.io_bound(order_bridge.send_squareoff, r["index"], r["opt"], r["strike"],
-                                         r.get("expiry") or (mon.expiry if mon else None), f"{reason} at {at}")
-                r["c_done"] = f"{at} {reason} {res['status'].upper()}"
-                r["detail"] = f"{r.get('detail', '')} | {reason} {at} ({price}): square-off {res['status'].upper()}".strip(" |")
-                self.log(res["message"])
-                self.notify(f"{r['index']} {r['strike']}{r['opt']}: {reason} at {at} - square-off {res['status'].upper()}",
-                            "warning" if res["status"] == "sent" else "negative",
-                            f"{r['index']} square-off {r['strike']}{r['opt']}")
+                ok = self._request_exit(r, reason)
+                r["c_done"] = f"{at} {reason} " + ("EXIT REQUESTED" if ok else "NOT MANAGED")
+                r["detail"] = f"{r.get('detail', '')} | {reason} {at} ({price}): " + (
+                    "exit requested" if ok else "not managed in this mode").strip(" |")
+                self.log(f"{r['index']} {r['strike']}{r['opt']}: {reason} at {at} ({price}) - "
+                         + ("exit requested." if ok else "order placed in another mode: not managed now."))
+                self.notify(f"{r['index']} {r['strike']}{r['opt']}: {reason} at {at} - "
+                            + ("exiting" if ok else "NOT managed (other mode)"),
+                            "warning" if ok else "negative", f"{r['index']} exit {r['strike']}{r['opt']}")
             if new_exits or custom_exits:
                 self._rewrite_orders_file()
             self.bump("orders")
+
+    # ------------------------------------------------------------------ broker orders: entry + position (PR 3)
+    def _bk(self, o):
+        """The order's broker position state (positions.py), parsed once and kept on the row; None for rows
+        without one."""
+        if not o:
+            return None
+        if o.get("_bk") is None:
+            try:
+                o["_bk"] = json.loads(o.get("bk") or "null")
+            except (TypeError, ValueError):
+                o["_bk"] = None
+            if o["_bk"] is None:
+                o["_bk"] = False
+        return o["_bk"] or None
+
+    def _manager(self):
+        return positions.PositionManager(self.broker, float(config.AUTO_ORDER_SL_LIMIT_GAP))
+
+    def _live_count_today(self) -> int:
+        return sum(1 for o in self.order_log if o.get("status") == "SENT" and (self._bk(o) or {}).get("mode") != "dry")
+
+    def _order_plan(self, sig) -> dict:
+        """SL / Target / trail of a new order (positions.new_state plan) from the signal's params and app rules."""
+        cfg = config.AUTO_ORDER[sig["index"]]
+        p, app = sig.get("params") or {}, sig.get("app_rules") or {}
+        sl = None if p.get("is_sl") is False else {"type": p.get("sl_type", cfg.get("sl_type", "POINT")),
+                                                   "value": float(p.get("sl", cfg.get("sl")))}
+        tgt = None if p.get("is_tgt") is False else {"type": p.get("tgt_type", cfg.get("tgt_type", "POINT")),
+                                                     "value": float(p.get("tgt", cfg.get("tgt")))}
+        max_sl = None
+        c_sl = exit_rules.parse(app.get("c_sl"))
+        if sl is None and c_sl and c_sl.get("type") == "CANDLE" and sig.get("kind") != "opening":
+            max_sl = float(cfg.get("candle_max_sl", 17) or 0) or None       # safety SL for a CANDLE-only SL
+        trail = None
+        t = self.app_trail({"c_trail": app.get("c_trail", "")})
+        if t:
+            trail = {"trigger": float(t["trigger"]), "gap": float(t["gap"]), "step": float(t.get("step") or 1)}
+        elif p.get("trail", cfg.get("trail")):
+            trail = {"trigger": float(p.get("trail_trigger", cfg.get("trail_trigger", 20))),
+                     "gap": float(p.get("trail_gap", cfg.get("trail_gap", 20))),
+                     "step": float(p.get("trail_point", cfg.get("trail_point", 1)) or 1)}
+        return {"sl": sl, "max_sl": max_sl, "tgt": tgt, "trail": trail}
+
+    @staticmethod
+    def _payload(sig, plan, mode, broker_name, tag, lots, units) -> dict:
+        """What was sent, kept in the orders file (JSON column). Uses the keys trade_tracker._params reads."""
+        sl, tgt, tr = plan.get("sl"), plan.get("tgt"), plan.get("trail")
+        return {"type": "broker_order", "broker": broker_name, "mode": mode, "order_type": "MARKET",
+                "transaction_type": "BUY", "qty": lots, "units": units, "tag": tag,
+                "is_sl": bool(sl), "sl_type": (sl or {}).get("type", ""), "sl_value": (sl or {}).get("value"),
+                "max_sl": plan.get("max_sl"),
+                "is_tgt": bool(tgt), "tgt_type": (tgt or {}).get("type", ""), "tgt_value": (tgt or {}).get("value"),
+                "is_trail_set": bool(tr), "trail_trigger": (tr or {}).get("trigger"),
+                "trail_gap": (tr or {}).get("gap"), "trail_point": (tr or {}).get("step")}
+
+    async def place_entry(self, sig) -> dict:
+        """Sends one entry (market BUY) through the broker of the current mode and starts its position.
+        Returns {"status": sent|dry_run|failed|blocked, "message", "payload", "detail", "bk"}.
+        Pause algo and (Sandbox / Live) the daily order limit apply. The SL goes to the exchange after the fill."""
+        name, mode = sig["index"], config.BROKER_MODE
+        lots = int((sig.get("params") or {}).get("qty") or config.AUTO_ORDER[name]["qty"])
+        units = lots * int(config.INDEXES[name]["lot_size"])
+        plan = self._order_plan(sig)
+        self._tag_seq += 1
+        tag = f"BEP-{_now().strftime('%H%M%S')}-{self._tag_seq}"
+        payload = self._payload(sig, plan, mode, self.broker.name, tag, lots, units)
+        head = f"{name} {sig['opt']} {sig['strike']} [{sig.get('kind_label', 'Opening candle')}]"
+        if config.AUTO_ORDER_PAUSED:
+            return {"status": "blocked", "message": f"Algo trading is PAUSED; NOT sent: {head}", "payload": payload,
+                    "detail": "Algo trading paused"}
+        if mode != "dry" and self._live_count_today() >= config.AUTO_ORDER_DAILY_LIMIT:
+            why = f"Daily limit ({config.AUTO_ORDER_DAILY_LIMIT}) reached"
+            return {"status": "blocked", "message": f"{why}; NOT sent: {head}", "payload": payload, "detail": why}
+        ik, err = await self.option_key(name, sig["strike"], sig["opt"])
+        if not ik:
+            return {"status": "failed", "message": f"ORDER FAILED {head}: {err}", "payload": payload,
+                    "detail": err}
+        st = positions.new_state(mode, tag, ik, units, plan, float(sig["ltp"]), sig.get("kind", ""))
+        req = bk.OrderRequest(ik, bk.BUY, units, bk.MARKET, tag=tag, symbol=f"{name} {int(sig['strike'])} {sig['opt']}",
+                              ref_price=float(sig["ltp"]))
+        res = await run.io_bound(self._manager().place_entry, st, req, _stamp())
+        label = brokers.MODE_LABELS[mode].upper()
+        plan_txt = (f"SL {positions.sl_trigger(plan, float(sig['ltp'])) or '-'} at the exchange after the fill"
+                    + (f", target {positions.target_level(plan, float(sig['ltp']))}" if plan.get("tgt") else
+                       ", no target")
+                    + (f", trail {plan['trail']['trigger']:g}/{plan['trail']['gap']:g}" if plan.get("trail") else ""))
+        if res.ok:
+            status = "dry_run" if mode == "dry" else "sent"
+            detail = f"{label} {bk.describe(req)}, order {res.order_id}; {plan_txt}"
+            return {"status": status, "message": f"ORDER {label} {head} (LTP {float(sig['ltp']):.2f}): {detail}",
+                    "payload": payload, "detail": detail, "bk": st}
+        detail = f"{res.message}" + (f" ({res.code})" if res.code else "")
+        return {"status": "failed", "message": f"ORDER FAILED {head}: {detail}", "payload": payload,
+                "detail": detail + (" (not retried)" if not res.uncertain else "")}
+
+    def _request_exit(self, o, reason) -> bool:
+        """Asks the position manager to exit this order (done on the next 2 s tick)."""
+        st = self._bk(o)
+        if not st or st.get("mode") != config.BROKER_MODE:
+            return False
+        ok = positions.PositionManager.request_exit(st, reason, _stamp())
+        if ok:
+            o["detail"] = f"{o.get('detail', '')} | Exit requested: {reason} {_stamp()}".strip(" |")
+            self._rewrite_orders_file()
+            self.bump("orders", "watch")
+        return ok
+
+    def _card_for_order(self, o):
+        cw = self.watches.get(o.get("index"))
+        if not cw:
+            return None
+        return next((r for r in cw.rows if r.get("order_id") == o["id"]), None)
+
+    async def broker_tick(self):
+        """Every OPTION_LTP_SECONDS (market hours): moves every open broker position on (positions.py)."""
+        if self._bk_busy:
+            return
+        items, rows = [], {}
+        for o in self.order_log:
+            st = self._bk(o)
+            if not st or st.get("closed") or st.get("mode") != config.BROKER_MODE:
+                continue
+            items.append((o["id"], st, st.get("ik") or o.get("ik"), self.option_ltp.get(self._opt_key(o))))
+            rows[o["id"]] = o
+        if not items:
+            return
+        self._bk_busy = True
+        try:
+            now = _now()
+            eod = now.strftime("%H:%M") >= config.EOD_EXIT_TIME
+            events = await run.io_bound(self._manager().tick, items, _stamp(), eod)
+        except Exception as ex:
+            self.log(f"Broker tick error: {ex}")
+            return
+        finally:
+            self._bk_busy = False
+        for ev in events:
+            o = rows.get(ev["key"])
+            if o is None:
+                continue
+            what = f"{o['index']} {o['strike']}{o['opt']} #{o['id']}"
+            kind = ev["kind"]
+            if kind == "fill":
+                o["entry"], o["filled_qty"] = ev["price"], ev["qty"]
+                self.log(f"{what}: entry filled {ev['qty']} @ {ev['price']:.2f}.")
+            elif kind == "sl":
+                self.log(f"{what}: {ev['text']}.")
+            elif kind == "exit":
+                o.update(exit=ev["price"], exit_time=ev["time"][:5], exit_reason=ev["reason"])
+                o["detail"] = f"{o.get('detail', '')} | Exit: {ev['reason']} {ev['time']} @ {ev['price']}".strip(" |")
+                card = self._card_for_order(o)
+                if card and card.get("status") != "exited":
+                    card["status"] = "exited"
+                    self.watches[o["index"]].save()
+                self.log(f"{what}: EXIT {ev['reason']} @ {ev['price']}.")
+                self.notify(f"{o['index']} {o['strike']}{o['opt']}: exit {ev['reason']} @ {ev['price']}",
+                            "info", f"{o['index']} exit {o['strike']}{o['opt']}")
+            elif kind == "failed":
+                o["status"] = "FAILED"
+                o["detail"] = f"{o.get('detail', '')} | {ev['text']}".strip(" |")
+                card = self._card_for_order(o)
+                if card:
+                    self.watches[o["index"]].set_order_status(card["id"], "FAILED")
+                self.log(f"{what}: {ev['text']}.")
+                self.notify(f"{o['index']} {o['strike']}{o['opt']}: {ev['text']}", "negative")
+            elif kind == "alert":
+                o["detail"] = f"{o.get('detail', '')} | ALERT {ev['text']} {_stamp()}".strip(" |")
+                self.log(f"ALERT {what}: {ev['text']}.")
+                self.notify(f"{o['index']} {o['strike']}{o['opt']}: {ev['text']} - use Square off / Exit now",
+                            "negative", f"{o['index']} {ev['text'][:20]} {o['strike']}{o['opt']}")
+            else:
+                self.log(f"{what}: {ev.get('text', '')}")
+        self._rewrite_orders_file()
+        self.bump("orders", "watch")
 
     # ------------------------------------------------------------------ manual square-off
     @staticmethod
@@ -1207,6 +1387,9 @@ class Engine:
     def is_open(self, r) -> bool:
         """Order still holds a position as far as the app knows: placed, no exit yet, not squared off.
         A limit order holds one only once something is filled."""
+        st = self._bk(r)
+        if st:
+            return r.get("status") in ("SENT", "DRY RUN") and positions.is_open(st)
         m = limit_orders.parse(r.get("mg"))
         if m is not None and not limit_orders.held(m):
             return False
@@ -1215,7 +1398,7 @@ class Engine:
                 and "Square-off SENT" not in str(r.get("detail") or ""))
 
     def open_on_option(self, index, strike, opt, exclude_id=None) -> list:
-        """Open orders on the same option (AlgoDelta's squareoff_position closes all of them together)."""
+        """Open orders on the same option (asked before placing another order on it)."""
         try:
             k = int(float(strike))
         except (TypeError, ValueError):
@@ -1246,59 +1429,37 @@ class Engine:
         return None
 
     async def square_off(self, order_id, reason="Manual square-off"):
-        """Sends AlgoDelta's squareoff_position for the order's option. It closes the WHOLE position on that
-        option, so every open order on it is marked. Not blocked by Pause algo / the daily limit.
-        Live: SENT, then Exit / P&L come from the Upstox trade book (refreshed at once). Dry run: Exit = LTP now."""
+        """Exits THIS order only: its exchange SL order becomes MARKET (or a market SELL without one) on the next
+        2 s tick. Not blocked by Pause algo / the daily limit. Returns {"status", "message"} or None."""
         o = next((x for x in self.order_log if x["id"] == order_id), None)
-        if not o or not (self.is_open(o) or str(o.get("sq") or "").startswith("FAILED")):
+        if not o:
             return None
-        group = [o] + self.open_on_option(o["index"], o["strike"], o["opt"], exclude_id=o["id"])
-        for x in group:                                 # a partly filled limit order: cancel the rest first
-            if limit_orders.cancellable(limit_orders.parse(x.get("mg"))):
-                await self.cancel_limit(x["id"], "Before square-off")
-        mon = self.monitors.get(o["index"])
-        res = await run.io_bound(order_bridge.send_squareoff, o["index"], o["opt"], o["strike"],
-                                 o.get("expiry") or (mon.expiry if mon else None), reason)
+        st = self._bk(o)
+        if not st:
+            self.log(f"#{order_id}: not a broker order - square it off in the Upstox app.")
+            return {"status": "failed", "message": "not a broker order"}
+        if st.get("mode") != config.BROKER_MODE:
+            msg = (f"#{order_id} was placed in {brokers.MODE_LABELS.get(st.get('mode'), st.get('mode'))} mode; "
+                   f"switch the order mode back to square it off.")
+            self.notify(msg, "warning")
+            return {"status": "failed", "message": msg}
+        if not self._request_exit(o, reason):
+            return None
         t = _stamp()
-        self.log(res["message"])
-        ltp = None
-        if any(x.get("status") == "DRY RUN" for x in group):
-            ltp = await self._exit_ltp(o)
-        for x in group:
-            mx = limit_orders.parse(x.get("mg"))
-            if mx is not None and not mx.get("exit"):      # remember why a limit position was closed (card chip)
-                mx["exit"] = f"{reason} {t}"
-                self._limit_save(x, mx)
-            if x.get("status") == "DRY RUN":
-                x["sq"] = f"DRY RUN {t}"
-                if ltp is not None:
-                    x.update(exit=ltp, exit_time=t[:5], exit_reason=reason)
-                note = f"{reason} {t} (dry run" + (f", exit {ltp}" if ltp is not None else "") + ")"
-            else:
-                x["sq"] = {"sent": f"SENT {t}", "failed": f"FAILED {t}"}.get(res["status"], f"NOT SENT (dry run) {t}")
-                note = f"{reason} {t}: square-off " + x["sq"].rsplit(" ", 1)[0]
-            x["detail"] = f"{x.get('detail', '')} | {note}".strip(" |")
-        others = f" (also closes {', '.join(self.order_label(x) for x in group[1:])})" if len(group) > 1 else ""
-        self.notify(f"{o['index']} {o['strike']}{o['opt']}: {reason} "
-                    f"{ORDER_STATUS.get(res['status'], res['status'].upper())}{others}",
-                    {"sent": "warning", "dry_run": "info"}.get(res["status"], "negative"),
+        o["sq"] = f"SENT {t}" if st.get("mode") != "dry" else f"DRY RUN {t}"
+        self.log(f"{o['index']} {o['strike']}{o['opt']} #{o['id']}: {reason} - exit requested.")
+        self.notify(f"{o['index']} {o['strike']}{o['opt']}: {reason} - exiting", "warning",
                     f"{o['index']} square-off {o['strike']}{o['opt']}")
         self._rewrite_orders_file()
-        if res["status"] == "sent":
-            self._trades_at = 0.0                       # fetch the exit fill now instead of in up to 30 s
-            await self.refresh_order_tracking()
         self.bump("orders", "watch")
-        return res
+        return {"status": "sent" if st.get("mode") != "dry" else "dry_run", "message": "exit requested"}
 
     async def square_off_all(self):
-        """One squareoff_position per option that has an open order."""
-        done, results = set(), []
+        """Exits every open order (each one on its own)."""
+        results = []
         for o in list(self.order_log):
-            key = (o.get("index"), o.get("opt"), str(o.get("strike")))
-            if key in done or not self.is_open(o):
-                continue
-            done.add(key)
-            results.append(await self.square_off(o["id"], "Square off all"))
+            if self.is_open(o):
+                results.append(await self.square_off(o["id"], "Square off all"))
         return [r for r in results if r]
 
     # ------------------------------------------------------------------ Manual Entry LIMIT orders (limit_orders.py)
@@ -1370,6 +1531,11 @@ class Engine:
         r = cw.get(row_id)
         if not r or r["status"] != "triggered" or r.get("order_status") in ORDER_LOCKED:
             return None
+        if not LIMIT_ORDERS_READY:
+            self.notify(f"{name} {r['strike']}{r['opt']}: Limit / Stop-limit orders come in BEP Upstox PR 4 - "
+                        "use Strategy (market) for now.", "warning")
+            self.log(f"{name} {r['strike']}{r['opt']}: Limit / Stop-limit not available yet (PR 4); not sent.")
+            return None
         price = self.limit_price(r)
         if not price:
             self.notify(f"{name} {r['strike']}{r['opt']}: set the limit price first.", "warning")
@@ -1394,7 +1560,7 @@ class Engine:
         r["pending"] = None
         cw.set_order_status(row_id, "sending")
         self.bump("watch")
-        res = await run.io_bound(order_bridge.send_limit, sig)
+        res = {"status": "failed", "message": "limit orders come in PR 4", "payload": {}, "detail": "PR 4"}
         if res["status"] in ("sent", "dry_run"):
             m = {"price": price, "units": lots * config.INDEXES[name]["lot_size"], "state": "OPEN",
                  "msg": "Sent, waiting for the fill", "sent_at": t, "oid": None, "filled": 0, "fill": None,
@@ -1438,8 +1604,8 @@ class Engine:
             return None
         mon = self.monitors.get(o["index"])
         side = self.cancel_side_effects(o)
-        res = await run.io_bound(order_bridge.send_cancel, o["index"], o["opt"], o["strike"],
-                                 o.get("expiry") or (mon.expiry if mon else None), reason)
+        res = {"status": "failed", "message": f"cancel of old limit orders: not available (PR 4) - cancel "
+               f"{o['strike']}{o['opt']} in the Upstox app", "detail": "PR 4"}
         self.log(res["message"])
         if side:
             self.log(f"WARNING: cancel_order has no order id - it may also cancel the pending orders of "
@@ -1615,6 +1781,17 @@ class Engine:
         o = next((x for x in self.order_log if x["id"] == order_id), None)
         if not o or not self.order_rule_editable(o):
             return False
+        st = self._bk(o)
+        if st:                                           # broker position: replaces its trail (moves the exchange SL)
+            on = bool(trail and trail.get("on"))
+            st["plan"]["trail"] = {"trigger": float(trail["trigger"]), "gap": float(trail["gap"]),
+                                   "step": float(trail.get("point") or 1)} if on else None
+            self.log(f"{o['index']} {o['strike']}{o['opt']} #{o['id']}: trailing SL " + (
+                f"set (trigger {trail['trigger']:g}, gap {trail['gap']:g}, point {trail.get('point', 1):g}); it "
+                "moves the exchange SL" if on else "removed (the exchange SL stays where it is)") + ".")
+            self._rewrite_orders_file()
+            self.bump("orders", "watch")
+            return True
         if o.get("mg"):                                  # limit / stop-limit: replaces mg.trail (PR #42)
             m = limit_orders.parse(o["mg"])
             on = bool(trail and trail.get("on"))
@@ -1642,7 +1819,7 @@ class Engine:
         dirty = False
         for o in list(self.order_log):
             t = self.app_trail(o)
-            if not t or t.get("done") or o.get("mg") or not self.is_open(o):
+            if not t or t.get("done") or o.get("mg") or self._bk(o) or not self.is_open(o):
                 continue
             entry = trade_tracker._f(o.get("entry"))
             ltp = self.option_ltp.get(self._opt_key(o))
@@ -1668,6 +1845,14 @@ class Engine:
 
     def trail_text(self, o) -> str:
         """e.g. "Trail 20/19 (app) · SL 155" for the card / Order Details."""
+        st = self._bk(o)
+        if st:
+            tr = (st.get("plan") or {}).get("trail")
+            if not tr:
+                return ""
+            lvl = positions.trail_level(tr, st.get("fill"), st.get("high"))
+            return (f"Trail {tr['trigger']:g}/{tr['gap']:g}" + (f" \u00b7 SL {lvl:g}" if lvl is not None else "")
+                    + (f" \u00b7 exchange SL {st['sl_trg']:.2f}" if st.get("sl_trg") is not None else ""))
         t = self.app_trail(o)
         if not t:
             return ""
@@ -1678,6 +1863,9 @@ class Engine:
     # ------------------------------------------------------------------ per-order SL / Target (Order Details)
     @staticmethod
     def order_rule_editable(r) -> bool:
+        if Engine._bk(None, r):   # broker position: an edit REPLACES its rule (SL: the exchange order is modified)
+            return r.get("status") in ("SENT", "DRY RUN") and positions.is_open(r["_bk"]) and \
+                not r["_bk"].get("exit_req") and r["_bk"].get("mode") == config.BROKER_MODE
         m = limit_orders.parse(r.get("mg"))
         if m:                     # limit / stop-limit (PR #42): the app holds its rules, so an edit REPLACES them
             return (r.get("status") in ("SENT", "DRY RUN") and not m.get("exit") and not r.get("c_done")
@@ -1693,6 +1881,10 @@ class Engine:
         rule = exit_rules.parse(o.get("c_" + kind))
         if exit_rules.is_none(rule):
             rule = None
+        st = Engine._bk(None, o)
+        if rule is None and st and (st.get("plan") or {}).get(kind):
+            p = st["plan"][kind]
+            return exit_rules.make_rule(kind, p["type"], p["value"], custom=False)
         m = limit_orders.parse(o.get("mg"))
         if rule is None and m and m.get(kind):
             rule = exit_rules.make_rule(kind, m[kind]["type"], m[kind]["value"], custom=False)
@@ -1701,6 +1893,9 @@ class Engine:
     @staticmethod
     def order_trail(o):
         """App trailing SL of an order as {"trigger", "gap", "step", ...} (limit orders: from mg) or None."""
+        st = Engine._bk(None, o)
+        if st:
+            return (st.get("plan") or {}).get("trail")
         m = limit_orders.parse(o.get("mg"))
         if m:
             return m.get("trail")
@@ -1718,11 +1913,33 @@ class Engine:
 
     def set_order_custom(self, row_id, kind, rule):
         """Sets (rule) or clears (None) an order's own SL / Target after it was placed. Watched by the app.
-        Strategy order: AlgoDelta's original SL / Target stay active too (no modify syntax), so whichever hits
-        first exits. Limit / stop-limit order: the new rule REPLACES the old one (AlgoDelta holds none)."""
+        Broker position (BEP Upstox): the new rule REPLACES the old one (an LTP / POINT SL moves the exchange SL
+        order). Limit / stop-limit order (old path, PR 4): the new rule REPLACES the old one."""
         r = next((o for o in self.order_log if o["id"] == row_id), None)
         if not r or not self.order_rule_editable(r):
             return False
+        st = self._bk(r)
+        if st:                       # broker position: the new rule REPLACES the old one
+            plan = st["plan"]
+            if exit_rules.is_none(rule):
+                rule = None
+            if rule and rule["type"] == "CANDLE":
+                r["c_" + kind] = json.dumps({**rule, "set_at": _stamp()})
+                plan[kind] = None
+                if kind == "sl" and not plan.get("max_sl"):
+                    plan["max_sl"] = float(config.AUTO_ORDER[r["index"]].get("candle_max_sl", 17) or 0) or None
+            else:
+                r["c_" + kind] = ""
+                plan[kind] = {"type": rule["type"], "value": float(rule["value"])} if rule else None
+            if kind == "sl":
+                positions.PositionManager.reset_sl(st)      # move / place the exchange SL on the next tick
+            what = "SL" if kind == "sl" else "Target"
+            self.log(f"{r['index']} {r['strike']}{r['opt']} #{r['id']}: {what} "
+                     + (f"changed to {exit_rules.describe(rule)}" if rule else "removed")
+                     + (" (the exchange SL is moved)" if kind == "sl" and rule and rule["type"] != "CANDLE" else ""))
+            self._rewrite_orders_file()
+            self.bump("orders", "watch")
+            return True
         if r.get("mg"):
             self._set_limit_rule(r, kind, rule)
             self.log(f"{r['index']} {r['strike']}{r['opt']} limit order: {'SL' if kind == 'sl' else 'Target'} "

@@ -117,3 +117,12 @@ def option_instrument_keys(client, expiry: str, underlying_key: str = None):
         mapping.setdefault(int(strike), {})[opt] = ik
     _option_key_cache[cache_key] = mapping
     return mapping, None
+
+
+def option_symbol(index, expiry, strike, opt) -> str:
+    """Short option name for the screens, e.g. NIFTY26NOV2625400CE (index + expiry + strike + CE/PE)."""
+    try:
+        code = datetime.strptime(str(expiry), "%Y-%m-%d").strftime("%d%b%y").upper()
+    except ValueError:
+        code = ""
+    return f"{index}{code}{int(strike)}{opt}"

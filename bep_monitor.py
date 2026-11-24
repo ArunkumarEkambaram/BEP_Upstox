@@ -187,7 +187,7 @@ class BepMonitor:
 
     def _opening_sl(self, level, now) -> dict:
         """09:15 order SL (PR #41): a CANDLE close below BEP - open_sl_below on open_sl_tf-minute candles, watched
-        by the app (AlgoDelta gets is_sl false, so it holds no SL and cannot trail; the Setup trailing SL, if on,
+        by the app (with no max SL the order gets no exchange SL; the Setup trailing SL, if on,
         is watched by the app too). Returns {"params", "app_rules"}."""
         cfg = config.AUTO_ORDER.get(self.name, {})
         below = float(cfg.get("open_sl_below", 2) or 0)
@@ -201,7 +201,7 @@ class BepMonitor:
                 "step": float(cfg.get("trail_point") or 1), "set_at": now.strftime("%H:%M:%S"), "high": None,
                 "done": ""})
         max_sl = float(cfg.get("open_max_sl", 17) or 0)
-        if max_sl > 0:          # PR #47: AlgoDelta holds a POINT SL (entry - max_sl) as a backstop; the app keeps the trail
+        if max_sl > 0:          # PR #47: an exchange SL-M (fill - max_sl) as a backstop (BEP Upstox: positions.py); the trail moves it
             params = {"sl": max_sl, "sl_type": "POINT", "trail": False}
         else:
             params = {"is_sl": False}
@@ -311,7 +311,7 @@ class BepMonitor:
                 log_fn(f"BEP {self.name} opening candle: {opt} {strike} crossed BEP {level:.2f} + "
                        f"{float(cfg.get('open_entry_above', 2) or 0):g} (LTP {ltp:.2f}); SL = {cfg.get('open_sl_tf', 5)}-min "
                        f"close below {level - float(cfg.get('open_sl_below', 2) or 0):.2f} (app-watched)"
-                       + (f", max SL {float(cfg.get('open_max_sl', 17) or 0):g} pts below the fill (AlgoDelta)"
+                       + (f", max SL {float(cfg.get('open_max_sl', 17) or 0):g} pts below the fill (exchange SL-M)"
                           if float(cfg.get('open_max_sl', 17) or 0) > 0 else "")
                        + f" - order signal queued; no more {opt} orders today"
                        + (f" (also qualified, skipped: {others})" if others else ""))

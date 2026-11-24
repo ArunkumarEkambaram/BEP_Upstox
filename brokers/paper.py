@@ -10,6 +10,7 @@ Orders live in memory:
 `exit_by_tag` sells (or buys back) the net filled quantity of that tag's orders at the last LTP.
 """
 import itertools
+import time
 
 from . import base
 
@@ -18,15 +19,16 @@ class PaperBroker:
     name = "Paper"
     mode = "dry"
     capabilities = frozenset({base.CAP_MODIFY, base.CAP_CANCEL_BY_ID, base.CAP_STATUS, base.CAP_EXIT_BY_TAG,
-                              base.CAP_STOP_MARKET})
+                              base.CAP_STOP_MARKET, base.CAP_ORDER_BOOK})
 
     def __init__(self):
         self.orders = {}            # order_id -> dict
         self.last_ltp = {}          # instrument_key -> last LTP seen
         self._ids = itertools.count(1)
+        self._run = time.strftime("%H%M%S")      # IDs stay unique after an app restart (orders file keeps old ones)
 
     def _new_id(self):
-        return f"PAPER-{next(self._ids)}"
+        return f"PAPER-{self._run}-{next(self._ids)}"
 
     @staticmethod
     def _fill(o, price):
@@ -100,6 +102,9 @@ class PaperBroker:
         return base.OrderStatus(order_id, o["status"], o["order_type"], o["side"], o["quantity"], o["filled_qty"],
                                 o["pending_qty"], o["avg_price"], o["price"], o["trigger_price"], o["tag"],
                                 "dry run")
+
+    def order_book(self):
+        return [self.status(oid) for oid in self.orders]
 
     def exit_by_tag(self, tag):
         if not tag:

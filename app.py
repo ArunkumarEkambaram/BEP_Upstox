@@ -20,7 +20,7 @@ import exit_rules
 import export_utils
 import limit_orders
 import market_utils
-import order_bridge
+import positions
 import trade_tracker
 from common_watch import CommonWatch
 from engine import engine
@@ -204,8 +204,8 @@ def root():
             mode_badge.set_text("ALGO PAUSED")
             mode_badge.props("color=grey-7")
         else:
-            mode_badge.set_text("DRY RUN" if config.AUTO_ORDER_DRY_RUN else "LIVE")
-            mode_badge.props("color=" + ("orange-8" if config.AUTO_ORDER_DRY_RUN else "red"))
+            mode_badge.set_text({"dry": "DRY RUN", "sandbox": "SANDBOX", "live": "LIVE"}[config.BROKER_MODE])
+            mode_badge.props("color=" + {"dry": "orange-8", "sandbox": "purple-6", "live": "red"}[config.BROKER_MODE])
         la = engine.limit_active()
         app_sl_badge.set_text(" · ".join(([f"APP-MANAGED SL ACTIVE ({la['held']}) - keep this PC on"] if la["held"] else [])
                                          + ([f"LIMIT OPEN ({la['waiting']})"] if la["waiting"] else [])))
@@ -844,12 +844,10 @@ def order_type_dialog(name, r):
                           value=r.get("entry_price") if r.get("entry_mode") == "limit" else r.get("price"),
                           min=0, step=0.05).classes("w-full")
         price.bind_visibility_from(mode, "value", lambda v: v == "limit")
-        ui.label("Strategy = AlgoDelta strategy_order (market; AlgoDelta holds SL / Target / trailing). "
-                 "Limit = AlgoDelta limit_order: buy at the price or cheaper (fills at once if the LTP is already "
-                 "below it). Stop-limit = AlgoDelta sl_order: waits at the exchange until the LTP RISES to the "
-                 "trigger (asked next, above the LTP), then a limit at the limit price. "
-                 "For Limit / Stop-limit the SL / Target / trailing are watched by this app (square-off when hit); "
-                 "cancelled if the card fails, at 15:15 or when deleted.").classes("text-xs opacity-70")
+        ui.label("Strategy = market BUY; after the fill the SL waits at the exchange (SL-M), trailing moves it, "
+                 "the target is watched by the app. Limit = buy at the price or cheaper; Stop-limit = wait until "
+                 "the LTP RISES to the trigger. Limit / Stop-limit come in BEP Upstox PR 4 (refused at ⚡ until "
+                 "then).").classes("text-xs opacity-70")
 
         def save():
             limit = mode.value == "limit"
@@ -911,7 +909,8 @@ OM_VIEW = {"compact": False}                      # Cards / Compact (table) view
 CHIP = {"WAITING": "grey-7", "TRIGGERED": "green-7", "SENDING": "blue-7", "ORDERED": "blue-7",
         "EXITED": "purple-6", "FAILED": "red-7", "ORDER FAILED": "red-7", "BLOCKED": "orange-8", "PENDING": "amber-9",
         "SQUARING OFF": "deep-orange-8", "SQUARE-OFF FAILED": "red-7", "LIMIT OPEN": "amber-9", "FILLED": "blue-7",
-        "CANCELLING": "deep-orange-8", "CANCEL FAILED": "red-7", "CANCELLED": "grey-7", "REJECTED": "red-7"}
+        "CANCELLING": "deep-orange-8", "CANCEL FAILED": "red-7", "CANCELLED": "grey-7", "REJECTED": "red-7",
+        "NO SL": "red-7", "EXIT FAILED": "red-7", "EXITING": "deep-orange-8"}
 
 
 def card_state(r, order=None) -> str:
@@ -923,6 +922,19 @@ def card_state(r, order=None) -> str:
     if os_ == "sending":
         return "SENDING"
     if os_ in ("SENT", "DRY RUN"):
+        st = engine._bk(order) if order else None
+        if st:                                             # broker position (positions.py)
+            if st.get("exit") is not None or (order and trade_tracker._f(order.get("exit")) is not None):
+                return f"EXITED · {st.get('exit_reason') or 'Exit'}"
+            if st.get("alert"):
+                return st["alert"]
+            if st.get("exit_req"):
+                return f"EXITING · {st['exit_req']}"
+            if st.get("fill") is None:
+                return f"ORDERED · {os_} · waiting for the fill"
+            if st.get("sl_trg") is not None and st.get("sl_id"):
+                return f"ORDERED · SL {st['sl_trg']:.2f}"
+            return f"ORDERED · {os_}"
         m = limit_orders.parse((order or {}).get("mg"))
         if m and not limit_orders.held(m):                 # limit order with nothing filled yet
             return limit_orders.state_text(m)
@@ -961,9 +973,9 @@ def card_symbol(name, r) -> str:
     exp = engine.monitors[name].expiry
     if r.get("kind") == "pair":
         if r.get("opt"):                             # a side fired: show the leg that is ordered / orderable
-            return order_bridge.symbol(name, exp, r["strike"], r["opt"])
-        return f"{order_bridge.symbol(name, exp, r['ce_strike'], 'CE')} / {r['pe_strike']}PE"
-    return order_bridge.symbol(name, exp, r["strike"], r["opt"])
+            return market_utils.option_symbol(name, exp, r["strike"], r["opt"])
+        return f"{market_utils.option_symbol(name, exp, r['ce_strike'], 'CE')} / {r['pe_strike']}PE"
+    return market_utils.option_symbol(name, exp, r["strike"], r["opt"])
 
 
 def card_ltp_text(name, r) -> str:
@@ -1111,9 +1123,8 @@ def trail_dialog(name, r, cur=None, on_save=None, note=None):
         sl_rule = exit_rules.parse((r or {}).get("c_sl"))
         ui.label(note or ("Watched by the app for this limit order (no change after placing)."
                           if (r or {}).get("entry_mode") == "limit" else
-                          "Watched by the app on the live LTP (the CANDLE SL stops AlgoDelta from trailing)."
-                          if sl_rule and sl_rule["type"] == "CANDLE" else
-                          "Sent with this card's AlgoDelta order (no change after placing).")).classes("text-xs opacity-70")
+                          "Moves this order's exchange SL up (modify), checked on the live LTP every 2 s.")
+                 ).classes("text-xs opacity-70")
 
         def save():
             if on.value:
@@ -1157,8 +1168,7 @@ def trail_dialog(name, r, cur=None, on_save=None, note=None):
 
 def card_trail_box(name, r, locked):
     """Trailing box: the card's own trailing SL or Setup's; click to change until ordered. With a CANDLE SL the
-    trail is watched by the app (AlgoDelta gets is_sl false and cannot trail). Once ordered: the app trail can be
-    added / changed while the order is open."""
+    trail moves the exchange SL order. Once ordered: the trail can be added / changed while the order is open."""
     sl_rule = exit_rules.parse(r.get("c_sl"))
     order = engine.row_order(r) if locked else None
     own = bool(r.get("c_trail"))
@@ -1177,8 +1187,7 @@ def card_trail_box(name, r, locked):
                 v.classes("cursor-pointer")
                 v.on("click", lambda _e=None, cur=cur: trail_dialog(
                     name, r, cur=cur, on_save=lambda tr: engine.set_order_trail(order["id"], tr),
-                    note="Watched by the app on the live LTP. This replaces the order's trailing SL "
-                         "(AlgoDelta holds none for a limit / stop-limit order)."))
+                    note="Watched by the app on the live LTP. This replaces the order's trailing SL."))
             return
         if order:                                     # app trail if set, else what was actually sent
             prm = trade_tracker._params(order)
@@ -1201,8 +1210,7 @@ def card_trail_box(name, r, locked):
                 v.classes("cursor-pointer")
                 v.on("click", lambda _e=None, cur=cur: trail_dialog(
                     name, r, cur=cur, on_save=lambda tr: engine.set_order_trail(order["id"], tr),
-                    note="Watched by the app on the live LTP for this order. AlgoDelta's own trail (if sent) stays "
-                         "too - whichever hits first exits."))
+                    note="Replaces this order's trailing SL: it moves the exchange SL order (never down)."))
             return
         candle_sl = bool(sl_rule and sl_rule["type"] == "CANDLE")
         tr = engine.row_trail(name, r)
@@ -1306,7 +1314,7 @@ def cancel_limit_dialog(order_id):
     if not limit_orders.cancellable(m):
         return
     retry = m["state"] == "CANCEL FAILED"
-    sym = order_bridge.symbol(o["index"], o.get("expiry") or engine.monitors[o["index"]].expiry, o["strike"], o["opt"])
+    sym = market_utils.option_symbol(o["index"], o.get("expiry") or engine.monitors[o["index"]].expiry, o["strike"], o["opt"])
     with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 440px"):
         ui.label(("Retry cancel " if retry else "Cancel limit order ") + sym).classes("text-lg font-bold")
         ui.label(f"Limit {m['price']:.2f} \u00b7 {engine.order_label(o)} \u00b7 {o.get('status')}").classes("text-sm")
@@ -1337,7 +1345,7 @@ def square_off_dialog(order_id):
     units = lots * config.INDEXES.get(o["index"], {}).get("lot_size", 1)
     entry, ltp = trade_tracker._f(o.get("entry")), trade_tracker._f(o.get("ltp_live"))
     pnl = (ltp - entry) * units if entry is not None and ltp is not None else None
-    sym = order_bridge.symbol(o["index"], o.get("expiry") or engine.monitors[o["index"]].expiry, o["strike"], o["opt"])
+    sym = market_utils.option_symbol(o["index"], o.get("expiry") or engine.monitors[o["index"]].expiry, o["strike"], o["opt"])
     with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 440px"):
         ui.label(("Retry square off " if retry else "Square off ") + sym).classes("text-lg font-bold")
         with ui.grid(columns=2).classes("w-full gap-x-6 gap-y-1 text-sm"):
@@ -1347,15 +1355,10 @@ def square_off_dialog(order_id):
                          ("Approx. P&L", f"\u20b9{pnl:,.2f}" if pnl is not None else "--")):
                 ui.label(k).classes("opacity-60")
                 ui.label(str(v)).classes("font-medium")
-        if group:
-            with ui.card().classes("w-full bg-orange-10 text-orange-2"):
-                ui.label("AlgoDelta closes the WHOLE position on this option. These open orders are closed too:") \
-                    .classes("text-sm font-medium")
-                for g in group:
-                    ui.label("\u2022 " + engine.order_label(g)).classes("text-sm")
-        ui.label("Sends AlgoDelta squareoff_position (market). Not blocked by Pause algo or the daily limit. "
-                 + ("Dry run: the exit is recorded at the current LTP." if o.get("status") == "DRY RUN" else
-                    "Exit / P&L come from the Upstox trade book.")).classes("text-xs opacity-70")
+        ui.label("Exits THIS order only: its exchange SL order becomes MARKET (or a market SELL without one) within "
+                 "about 2 s. Other orders on the same option stay. Not blocked by Pause algo or the daily limit."
+                 + (" Dry run: the paper broker fills it at the LTP." if o.get("status") == "DRY RUN" else "")
+                 ).classes("text-xs opacity-70")
 
         async def go():
             dlg.close()
@@ -1402,8 +1405,7 @@ def confirm_same_option(name, r, then):
         ui.label(f"{r['strike']}{r['opt']} is already open").classes("text-lg font-bold")
         for o in opens:
             ui.label("\u2022 " + engine.order_label(o)).classes("text-sm")
-        ui.label("AlgoDelta's square-off closes the whole position on an option, so squaring off one of these "
-                 "orders later will close both.").classes("text-sm text-orange-4")
+        ui.label("Each order keeps its own SL and exits on its own.").classes("text-sm opacity-70")
 
         async def go():
             dlg.close()
@@ -2029,13 +2031,9 @@ def star_page():
 def manual_page():
     om_header("Manual Entry", "Pick a strike and place a BUY yourself - no trigger condition. Market = order at "
               "⚡ / Add & place. Price = the app waits until the LTP reaches your price (either way: ↓ a dip or "
-              "↑ a breakout), then sends a market order; Target / Stoploss / Trailing go with the AlgoDelta "
-              "strategy order. Limit = buy at this price OR CHEAPER (AlgoDelta limit order): it waits only if the "
-              "price is below the LTP; above the LTP it fills at once. Stop-limit = buy when the price RISES to the "
-              "trigger (AlgoDelta sl_order, waits at the exchange), then a limit at the limit price. For Limit and "
-              "Stop-limit the Target / Stoploss / Trailing are watched by THIS APP on the live LTP (square-off when "
-              "hit), so keep the PC on. Deleting a card with an open order cancels it (cancel_order); open orders "
-              "are cancelled at 15:15.")
+              "↑ a breakout), then sends a market order. After the fill the Stoploss waits at the exchange (SL-M), "
+              "Trailing moves it and the Target is watched by the app (it turns the SL into MARKET). Limit and "
+              "Stop-limit come in BEP Upstox PR 4 (refused at ⚡ until then): use Market or Price.")
     for name in engine.active():
         step = config.INDEXES[name]["strike_interval"]
         with ui.card().classes("w-full"):
@@ -2198,12 +2196,10 @@ def orders_page():
         cfg = config.AUTO_ORDER.get(r["index"], {})
         with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 460px"):
             ui.label(f"{r['index']} {r['strike']}{r['opt']} \u2014 SL / Target").classes("text-lg font-bold")
-            lim = bool(r.get("mg"))
-            ui.label("Watched by the app; when hit, the position is squared off (live) or the exit is recorded "
-                     "(dry run). " + ("Limit / stop-limit order: a change REPLACES its SL / Target (AlgoDelta holds "
-                                      "none)." if lim else
-                                      "AlgoDelta's original SL / Target stay active too - whichever hits first exits.")
-                     ).classes("text-xs opacity-70")
+            lim = bool(r.get("mg")) or bool(engine._bk(r))
+            ui.label("A change REPLACES this order's SL / Target. LTP / POINT SL: the exchange SL order is moved; "
+                     "CANDLE: watched by the app on candle closes (the max SL stays at the exchange); Target: watched "
+                     "by the app, at the target the SL order becomes MARKET.").classes("text-xs opacity-70")
 
             def setter(kind):
                 def on_set(rule):
@@ -2224,10 +2220,7 @@ def orders_page():
                 cur = {"on": True, "type": "LTP", "trigger": t["trigger"], "point": t["step"], "gap": t["gap"]} if t \
                     else {**engine.setup_trail(r["index"]), "on": True}
                 trail_dialog(r["index"], {}, cur=cur, on_save=lambda tr: engine.set_order_trail(rid, tr),
-                             note="Watched by the app on the live LTP. This replaces the order's trailing SL "
-                                  "(AlgoDelta holds none for a limit / stop-limit order)." if lim else
-                                  "Watched by the app on the live LTP for this order. AlgoDelta's own trail (if sent) "
-                                  "stays too - whichever hits first exits.")
+                             note="This replaces the order's trailing SL (it moves the exchange SL order).")
             with ui.row().classes("items-center gap-2"):
                 ui.label("Trailing: " + ((f"Trail {t['trigger']:g}/{t['gap']:g} (app)" if t else "none (app)") if lim
                                          else (engine.trail_text(r) or "none (app)"))).classes("text-sm")
@@ -2258,10 +2251,9 @@ def orders_page():
                          "App " + (limit_orders.describe(m) or "no SL / Target")] + parts
                 if m.get("exit"):
                     parts.append(m["exit"])
-            if not m and r.get("kind", "Opening candle") == "Opening candle" and r.get("c_sl"):
-                prm = trade_tracker._params(r)            # PR #47: the max SL AlgoDelta holds for the 09:15 order
-                if prm.get("is_sl") and prm.get("sl"):
-                    parts.append(f"Max SL {prm['sl']:g} pts (AlgoDelta)")
+            st = engine._bk(r)
+            if st:                                      # broker position: where its SL is now
+                parts.append(positions.summary(st))
             if engine.trail_text(r):
                 parts.append(engine.trail_text(r))
             r["rules_text"] = " \u00b7 ".join(parts) + (f" \u2192 {r['c_done']}" if r.get("c_done") else "")
@@ -2362,28 +2354,15 @@ def setup_page():
         # ---- Trading controls
         with ui.card().classes("flex-1 min-w-[320px]"):
             card_title("Trading", "shield")
-            dry = ui.switch("Dry run (only log the JSON, send nothing)", value=config.AUTO_ORDER_DRY_RUN)
-
-            def on_dry(ev):
-                if ev.value:
-                    engine.set_dry_run(True)
-                    return
-                with ui.dialog() as dlg, ui.card():
-                    ui.label("Turn OFF dry run? Orders will be sent to AlgoDelta and placed with real money.")
-                    with ui.row():
-                        ui.button("Cancel", on_click=dlg.close)
-                        ui.button("Yes, go live", on_click=lambda: (engine.set_dry_run(False), dlg.close())) \
-                            .props("color=red")
-                dlg.on("hide", lambda: dry.set_value(config.AUTO_ORDER_DRY_RUN))
-                dlg.open()
-            dry.on_value_change(on_dry)
+            ui.label("Dry run / Sandbox / Live: the order mode in Broker orders below (it starts in Dry run).") \
+                .classes("text-sm")
             ui.number("Max orders/day", value=config.AUTO_ORDER_DAILY_LIMIT, min=1, precision=0, step=1,
                       on_change=lambda ev: engine.set_daily_limit(int(ev.value or 1))).classes("w-full")
             ui.label("Pause alerts / Pause algo are in the header.").classes("text-xs opacity-70")
 
     broker_card()
     for name in config.INDEXES:
-        algodelta_card(name)
+        order_defaults_card(name)
 
 
 _STATUS_COLOR = {"COMPLETE": "green", "CANCELLED": "grey-7", "REJECTED": "red", "OPEN": "blue",
@@ -2391,14 +2370,14 @@ _STATUS_COLOR = {"COMPLETE": "green", "CANCELLED": "grey-7", "REJECTED": "red", 
 
 
 def broker_card():
-    """Setup > Broker orders (PR 2): mode, Upstox order settings, sandbox token and the Test order panel.
-    Until PR 3 the engine's own orders still go through AlgoDelta; this card only drives the Test order panel."""
+    """Setup > Broker orders: the order mode (Dry run / Sandbox / Live) of EVERY order, the Upstox order settings,
+    the sandbox token and the Test order panel."""
     name = engine.active()[0] if engine.active() else next(iter(config.INDEXES))
     with ui.card().classes("w-full"):
         card_title("Broker orders (Upstox direct)", "account_balance")
-        ui.label("New order path, being built. Until PR 3 the app's own orders (09:15, Order Management) still go "
-                 "through AlgoDelta; this card only drives the Test order panel below.") \
-            .classes("text-xs text-orange-5")
+        ui.label("The mode applies to every order: the 09:15 order, Order Management cards and the Test order "
+                 "panel. Entry = market BUY; after the fill an SL-M SELL waits at the exchange (trailing moves it; "
+                 "target / candle SL / square-off turn it into MARKET).").classes("text-xs opacity-70")
         with ui.row().classes("w-full gap-6 items-start"):
             # ---- mode + settings
             with ui.column().classes("flex-1 min-w-[300px] gap-2"):
@@ -2410,8 +2389,8 @@ def broker_card():
                 def show_mode():
                     mode_note.set_text({
                         "dry": "Dry run: nothing is sent; a paper broker fills orders on the live LTP.",
-                        "sandbox": "Sandbox: sent to api-sandbox.upstox.com with the sandbox token (no real money; "
-                                   "no order status there).",
+                        "sandbox": "Sandbox: sent to api-sandbox.upstox.com with the sandbox token (no real money). "
+                                   "It has no order status, so fills are assumed at the LTP.",
                         "live": "LIVE: real orders on your Upstox account. Needs the static IP registered in your "
                                 "Upstox app (else error UDAPI1154)."}[config.BROKER_MODE])
 
@@ -2423,7 +2402,8 @@ def broker_card():
                         show_mode()
                         return
                     with ui.dialog() as dlg, ui.card():
-                        ui.label("Switch broker orders to LIVE? Test orders will be real orders with real money.")
+                        ui.label("Switch to LIVE? Every order (09:15, Order Management, Test order) will be a real "
+                                 "Upstox order with real money.")
                         with ui.row():
                             ui.button("Cancel", on_click=dlg.close)
                             ui.button("Yes, live", on_click=lambda: (engine.set_broker_mode("live"), dlg.close())) \
@@ -2592,18 +2572,14 @@ def broker_card():
         when_changed(["broker"], render)
 
 
-def algodelta_card(name):
+def order_defaults_card(name):
+    """Setup > Order defaults: quantity, Target / SL / trail, per-type targets, 09:15 values and the exchange
+    max SL for cards whose SL is CANDLE only (was "AlgoDelta order settings" before BEP Upstox PR 3)."""
     ad_cfg = config.AUTO_ORDER[name]
     with ui.card().classes("w-full"):
-        card_title(f"{name} — AlgoDelta order settings", "send")
+        card_title(f"{name} — Order defaults", "tune")
         with ui.row().classes("w-full gap-6 items-start"):
             with ui.column().classes("flex-1 min-w-[320px] gap-2"):
-                ad_url = ui.input("Webhook URL (AlgoDelta: Copy Webhook)", value=ad_cfg["webhook_url"],
-                                  password=True, password_toggle_button=True).classes("w-full")
-                with ui.row().classes("items-center gap-2"):
-                    ui.button("JSON template", icon="edit", on_click=lambda: tpl_dialog.open()) \
-                        .props("flat dense no-caps color=primary").classes("underline")
-                    tpl_tag = ui.badge("default").props("outline color=grey-6")
                 ad_qty = ui.number("Quantity (lots)", value=ad_cfg["qty"], min=1, precision=0, step=1).classes("w-full")
                 with ui.row().classes("w-full gap-2 no-wrap"):
                     ad_tgt_type = ui.select(["POINT", "LTP"], value=ad_cfg.get("tgt_type", "POINT"), label="Target type").classes("flex-1")
@@ -2611,6 +2587,20 @@ def algodelta_card(name):
                 with ui.row().classes("w-full gap-2 no-wrap"):
                     ad_sl_type = ui.select(["POINT", "LTP"], value=ad_cfg.get("sl_type", "POINT"), label="Stop loss type").classes("flex-1")
                     ad_sl = ui.number("Stop loss value", value=ad_cfg["sl"], min=0, step=1).classes("flex-1")
+                ad_candle_max = ui.number("Max SL for cards with a CANDLE SL: points below the fill (exchange, 0 = none)",
+                                          value=ad_cfg.get("candle_max_sl", 17), min=0, step=1).classes("w-full") \
+                    .tooltip("A card whose SL is CANDLE only (exit on a candle close) also gets an SL-M order at the "
+                             "exchange this many points below the fill: it covers a fast fall inside a candle and the "
+                             "app being down.")
+                ad_trail = ui.switch("Trailing SL", value=ad_cfg.get("trail", False))
+                with ui.row().classes("w-full gap-2 no-wrap"):
+                    ad_trail_trigger = ui.number("Trigger", value=ad_cfg.get("trail_trigger", 20), min=0, step=1).classes("flex-1")
+                    ad_trail_point = ui.number("Point", value=ad_cfg.get("trail_point", 1), min=0, step=1).classes("flex-1")
+                    ad_trail_gap = ui.number("Gap", value=ad_cfg.get("trail_gap", 20), min=0, step=1).classes("flex-1")
+                for w in (ad_trail_trigger, ad_trail_point, ad_trail_gap):
+                    w.bind_enabled_from(ad_trail, "value")
+                ui.label("Trailing: once the high reaches entry + Trigger, the exchange SL moves to high - Gap (in "
+                         "steps of Point), never down.").classes("text-xs opacity-70")
             with ui.column().classes("flex-1 min-w-[320px] gap-2"):
                 ui.label("Default target for new Order Management rows (each row can be changed until ordered; "
                          "type follows Target type; the 09:15 order uses Target value)").classes("text-xs opacity-70")
@@ -2627,74 +2617,19 @@ def algodelta_card(name):
                         .tooltip("The 09:15 order fires at LTP >= BEP + this (0 = just above BEP)")
                     ad_open_sl = ui.number("09:15 SL: close below BEP -", value=ad_cfg.get("open_sl_below", 2),
                                            min=0, step=0.5).classes("flex-1") \
-                        .tooltip("CANDLE SL watched by the app: squares off when a candle CLOSES below BEP - this")
+                        .tooltip("CANDLE SL watched by the app: exits when a candle CLOSES below BEP - this")
                     ad_open_tf = ui.select({1: "1 min", 3: "3 min", 5: "5 min"}, value=int(ad_cfg.get("open_sl_tf", 5)),
                                            label="SL candle").classes("w-28")
-                ad_open_max = ui.number("09:15 max SL: points below the fill (AlgoDelta, 0 = none)",
+                ad_open_max = ui.number("09:15 max SL: points below the fill (exchange, 0 = none)",
                                         value=ad_cfg.get("open_max_sl", 17), min=0, step=1).classes("w-full") \
-                    .tooltip("A POINT SL held by AlgoDelta from its fill (e.g. entry 152 - 17 = 135), on top of the "
-                             "candle SL: exits on a fast fall or if this PC is off. The trailing SL stays with the app.")
+                    .tooltip("An SL-M order at the exchange from the fill (e.g. entry 152 - 17 = 135), on top of the "
+                             "candle SL: exits on a fast fall or if the app is down.")
                 ad_warn_bep = ui.number("Warn at \u26a1 when LTP is more than X points above BEP (0 = off)",
                                         value=ad_cfg.get("warn_above_bep", 10), min=0, step=1).classes("w-full") \
                     .tooltip("BEP Support \u2b50, BEP cross Pair and Manual Entry cards: 'Check before placing' "
                              "shows the LTP - BEP difference")
-                ad_exit_opp = ui.switch("Exit on opposite signal", value=ad_cfg.get("exit_on_opposite", False))
-                ad_trail = ui.switch("Trailing SL", value=ad_cfg.get("trail", False))
-                with ui.row().classes("w-full gap-2 no-wrap"):
-                    ad_trail_type = ui.select(["POINT", "LTP"], value=ad_cfg.get("trail_type", "LTP"), label="Trail type").classes("flex-1")
-                    ad_trail_trigger = ui.number("Trigger", value=ad_cfg.get("trail_trigger", 20), min=0, step=1).classes("flex-1")
-                    ad_trail_point = ui.number("Point", value=ad_cfg.get("trail_point", 1), min=0, step=1).classes("flex-1")
-                    ad_trail_gap = ui.number("Gap", value=ad_cfg.get("trail_gap", 20), min=0, step=1).classes("flex-1")
-                for w in (ad_trail_type, ad_trail_trigger, ad_trail_point, ad_trail_gap):
-                    w.bind_enabled_from(ad_trail, "value")
-                ad_confirm = ui.checkbox("I checked this JSON against the Syntax Generator", value=ad_cfg["confirmed"])
         ad_status = ui.label("").classes("text-sm")
-        with ui.row().classes("gap-2"):
-            ui.button("Save", icon="save", on_click=lambda: save())
-            ui.button("Preview JSON", on_click=lambda: preview()).props("outline")
-
-    with ui.dialog() as tpl_dialog, ui.card().style("width: 720px; max-width: 95vw"):
-        ui.label(f"{name} — JSON template (strategy_order)").classes("text-lg font-bold")
-        ad_template = ui.textarea(value=json.dumps(ad_cfg["templates"]["strategy_order"], indent=2)) \
-            .classes("w-full mono").props("outlined input-style='font-family: monospace; font-size: 12px' rows=18")
-        ui.label("Placeholders: {symbol} {opt} {signal} {qty} {tgt} {tgt_type} {sl} {sl_type} {strike} {expiry} {index} "
-                 "{bep} {ltp} {exit_on_opposite} {is_trail} {trail_type} {trail_trigger} {trail_point} {trail_gap}. "
-                 "{symbol} = index + expiry + strike + CE/PE, e.g. NIFTY17NOV2625400CE. {signal} = UP for CE, DOWN for PE. "
-                 "exit_on_opposite, is_trail_set and the trail_* keys are always set from the controls.").classes("text-xs opacity-70")
-        tpl_status = ui.label("").classes("text-sm")
-
-        def reset_template():
-            ad_template.set_value(json.dumps(config._STRATEGY_ORDER, indent=2))
-            tpl_status.set_text("Reset to the default template (not saved yet; click Save).")
-        with ui.row().classes("w-full gap-2 justify-end"):
-            ui.button("Reset to default", icon="restart_alt", on_click=reset_template).props("flat color=orange")
-            ui.button("Preview JSON", on_click=lambda: preview()).props("outline")
-            ui.button("Save", on_click=lambda: (save(), tpl_status.set_text(ad_status.text)))
-            ui.button("Close", on_click=tpl_dialog.close).props("flat")
-
-    def update_tag():
-        try:
-            cur = json.loads(ad_template.value)
-        except ValueError:
-            cur = None
-        text = "default" if cur == config._STRATEGY_ORDER else "edited"
-        if cur != ad_cfg["templates"]["strategy_order"]:
-            text += " · not saved"
-        tpl_tag.set_text(text)
-        tpl_tag.props("outline color=" + ("grey-6" if text == "default" else "orange"))
-    update_tag()
-    ad_template.on_value_change(lambda ev: (update_tag(), ad_confirm.set_value(False)))
-
-    def parse_template():
-        try:
-            obj = json.loads(ad_template.value)
-        except ValueError as ex:
-            return None, f"JSON error: {ex}"
-        if not isinstance(obj, dict):
-            return None, "The template must be one JSON object { ... }."
-        if obj.get("type") != "strategy_order":
-            return None, f"\"type\" must be \"strategy_order\" (found {obj.get('type')!r})."
-        return obj, ""
+        ui.button("Save", icon="save", on_click=lambda: save())
 
     def numbers():
         def num(v):
@@ -2717,9 +2652,9 @@ def algodelta_card(name):
         open_entry, open_sl = num(ad_open_entry.value), num(ad_open_sl.value)
         if open_entry is None or open_sl is None or open_entry < 0 or open_sl < 0:
             return None, "09:15 entry above BEP and SL below BEP must be numbers of 0 or more."
-        open_max = num(ad_open_max.value)
-        if open_max is None or open_max < 0:
-            return None, "09:15 max SL must be a number of 0 or more (0 = none)."
+        open_max, candle_max = num(ad_open_max.value), num(ad_candle_max.value)
+        if open_max is None or open_max < 0 or candle_max is None or candle_max < 0:
+            return None, "The max SL values must be numbers of 0 or more (0 = none)."
         trail = bool(ad_trail.value)
         t_trig, t_point, t_gap = num(ad_trail_trigger.value), num(ad_trail_point.value), num(ad_trail_gap.value)
         if trail:
@@ -2728,56 +2663,28 @@ def algodelta_card(name):
             if t_gap > t_trig:
                 return None, "Gap must not be larger than Trigger (Gap = Trigger moves the SL to cost at the trigger)."
         return {"tgt": tgt, "sl": sl, "qty": int(qty), "tgt_type": ad_tgt_type.value, "sl_type": ad_sl_type.value,
-                "exit_on_opposite": bool(ad_exit_opp.value), "trail": trail, "max_above_bep": max_above, **defaults,
+                "trail": trail, "max_above_bep": max_above, **defaults,
                 "open_entry_above": open_entry, "open_sl_below": open_sl, "open_sl_tf": int(ad_open_tf.value or 5),
-                "open_max_sl": open_max, "warn_above_bep": warn_bep,
-                "trail_type": ad_trail_type.value,
+                "open_max_sl": open_max, "candle_max_sl": candle_max, "warn_above_bep": warn_bep,
                 "trail_trigger": t_trig if t_trig is not None else ad_cfg.get("trail_trigger", 20),
                 "trail_point": t_point if t_point is not None else ad_cfg.get("trail_point", 1),
                 "trail_gap": t_gap if t_gap is not None else ad_cfg.get("trail_gap", 20)}, ""
 
     def save():
-        obj, err = parse_template()
-        if obj is None:
-            ad_status.set_text("❌ " + err)
-            return
         nums, err = numbers()
         if nums is None:
             ad_status.set_text("❌ " + err)
             return
-        url = (ad_url.value or "").strip()
-        if url and not url.lower().startswith("https://"):
-            ad_status.set_text("❌ The webhook URL must start with https://")
-            return
-        saved = engine.save_auto_order(name, obj, nums, url, bool(ad_confirm.value))
-        update_tag()
-        trail_txt = (f"trail ON ({nums['trail_type']}: trigger {nums['trail_trigger']}, point {nums['trail_point']}, "
-                     f"gap {nums['trail_gap']})" if nums["trail"] else "trail OFF")
+        saved = engine.save_order_defaults(name, nums)
+        trail_txt = (f"trail ON (trigger {nums['trail_trigger']}, point {nums['trail_point']}, gap {nums['trail_gap']})"
+                     if nums["trail"] else "trail OFF")
         ad_status.set_text(f"✅ {saved} Target {nums['tgt']} ({nums['tgt_type']}; rows: same {nums['tgt_same']:g}, "
-                           f"pair {nums['tgt_pair']:g}, \u2b50 {nums['tgt_star']:g}, manual {nums['tgt_manual']:g}), SL {nums['sl']} ({nums['sl_type']}), "
-                           f"qty {nums['qty']}; {trail_txt}; exit on opposite {'ON' if nums['exit_on_opposite'] else 'OFF'}; "
+                           f"pair {nums['tgt_pair']:g}, \u2b50 {nums['tgt_star']:g}, manual {nums['tgt_manual']:g}), "
+                           f"SL {nums['sl']} ({nums['sl_type']}), qty {nums['qty']}; {trail_txt}; "
+                           f"CANDLE-SL cards: max SL {nums['candle_max_sl']:g} pts at the exchange; "
                            f"09:15 order at LTP >= BEP + {nums['open_entry_above']:g} and < BEP + {nums['max_above_bep']}, "
                            f"SL = {nums['open_sl_tf']}-min close below BEP - {nums['open_sl_below']:g} (app)"
-                           + (f", max SL {nums['open_max_sl']:g} pts (AlgoDelta); " if nums['open_max_sl'] else "; ")
-                           + f"webhook {'set' if url else 'NOT set'}; JSON {'confirmed' if ad_confirm.value else 'NOT confirmed'} "
-                           f"(live orders need both).")
-
-    def preview():
-        obj, err = parse_template()
-        if obj is None:
-            ad_status.set_text("❌ " + err)
-            return
-        nums, err = numbers()
-        if nums is None:
-            ad_status.set_text("❌ " + err)
-            return
-        sample = {"index": name, "opt": "CE", "strike": 25400, "expiry": "2026-11-17", "bep": 100.0, "ltp": 101.5}
-        payload = order_bridge.build_payload(sample, obj, nums)
-        with ui.dialog() as dlg, ui.card():
-            ui.label(f"Sample order JSON ({name} 25400 CE, expiry 17 Nov 2026)").classes("font-bold")
-            ui.code(json.dumps(payload, indent=2), language="json")
-            ui.button("Close", on_click=dlg.close)
-        dlg.open()
+                           + (f", max SL {nums['open_max_sl']:g} pts (exchange)." if nums['open_max_sl'] else "."))
 
 
 # ====================================================================== Logs

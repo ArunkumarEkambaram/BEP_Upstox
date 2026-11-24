@@ -4,7 +4,7 @@ Repo: `ArunkumarEkambaram/BEP_Upstox` (default branch `master`; updated together
 Run: `python app.py` → http://localhost:**8084** (`config.APP_PORT`). Needs `nicegui>=3.1.0`, Python 3.14 on the user's PC.
 **What it is:** a copy of `ArunkumarEkambaram/BEP-AlgoDelta` (`main` at its PR #49, full history kept) that will send orders **directly to Upstox** (with a registered static IP, later on a cloud server) instead of through AlgoDelta. The BEP logic (Support board, ⭐, Pair cross, Replay, Order Management triggers, exit rules, Order Details) stays the same; the order path is replaced.
 Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until this one is proven live; port 8083; important BEP-logic fixes are ported to **both** apps until one is retired), `ArunkumarEkambaram/LTP_Crossing` (reference only, do not change).
-**Until PR 3 is merged, orders in this app still go through the inherited AlgoDelta code.** Keep it in Dry run (the default at every start) and leave its AlgoDelta webhook empty, so it never trades next to the AlgoDelta app.
+**Since PR 3 there is no AlgoDelta code in this app:** every order goes through the broker layer (`brokers/`, `positions.py`) in the mode chosen on Setup › Broker orders: Dry run (default at every start) / Sandbox / Live. The BEP-AlgoDelta app is the safety backup.
 
 ## Working rules agreed with the user (same as BEP-AlgoDelta)
 - **Always discuss requirements before writing code.** Ask questions with "Suggested:" answers and wait for the user's go-ahead.
@@ -15,11 +15,13 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
 - `__pycache__/`, `settings.json`, `upstox_token.json`, `sandbox_token.json`, `orders_*.csv` and `common_watch_*.json` are git-ignored. Never commit them.
 - The cloud session can't delete GitHub branches (proxy 403). The user deletes merged branches, or turns on "Automatically delete head branches".
 - This repo's default branch is `master` (created by the user on GitHub). PRs target `master`.
+- **New features and fixes go into BOTH projects** (BEP_Upstox and BEP-AlgoDelta) until one is retired (user, 24 Nov): one PR per repo, and remind the user to merge both.
 
 ## BEP Upstox plan and status
 - **PR 1 (copy and rename):** this repo = BEP-AlgoDelta `main` with its history, title "BEP Upstox" (`config.APP_NAME`), port 8084 (`config.APP_PORT`). Settings, token, orders and Order Management files are kept next to `app.py`, so a separate folder gives this app its own `settings.json`, `upstox_token.json`, `orders_*.csv` and `common_watch_*.json`. The same Upstox token works in both apps.
-- **PR 2 (broker layer + Upstox adapter):** see "BEP Upstox decisions" below. The engine's own orders still go through AlgoDelta (`order_bridge.py`); only the Setup **Test order** panel uses the new layer.
-- **Next PRs:** (3) the engine on the broker layer: strategy orders = market BUY → SL order at the exchange after the fill, trailing by modify, target / candle SL by modifying the SL to MARKET; (4) Limit / Stop-limit / cancel / square-off by order ID; (5) login + cloud deploy script.
+- **PR 2 (broker layer + Upstox adapter):** see "BEP Upstox decisions" below (decisions 3–4).
+- **PR 3 (engine on the broker layer, AlgoDelta removed):** decision 6 below.
+- **Next PRs:** (4) Limit / Stop-limit on the broker layer (they're refused at ⚡ until then, `engine.LIMIT_ORDERS_READY`); (5) login + cloud deploy script.
 
 - The plan as agreed in BEP-AlgoDelta on 23 Nov 2026 (copied unchanged; "this app" there means BEP-AlgoDelta):
   - **PLANNED: a separate "BEP Upstox" app (Upstox direct + cloud), agreed 23 Nov 2026; start on 24 Nov (market holiday).** This app (AlgoDelta) stays unchanged and in use until BEP Upstox is proven live. **Target: switch before the AlgoDelta subscription ends (joined 15 Nov 2026, paid to about 14 Dec).**
@@ -72,8 +74,26 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
    - In the cloud the PC doesn't need to be on; a browser (PC or phone) is needed for the morning token, the BEP CSV, ⚡ clicks and to see alerts.
    - **Single user:** one trader, many devices. Multi-user would be a redesign and, under NSE Circular 58/2026, would make the user an algo provider (empanelment needed). Not planned.
 
+6. **PR 3: the engine on the broker layer; AlgoDelta removed (user, 24 Nov: "remove AlgoDelta"; all PR 3 questions "suggested").**
+   - **Removed:** `order_bridge.py`, the webhook / JSON template / "I checked this JSON" / "Exit on opposite", the old Trading "Dry run" switch (the order mode is the only switch; `config.AUTO_ORDER_DRY_RUN` = mode is "dry"). `init.txt` removed. The header badge shows DRY RUN / SANDBOX / LIVE.
+   - **Setup › Order defaults** (was "AlgoDelta order settings"): quantity, Target / SL type + value, per-type targets, trailing (trigger / point / gap), the 09:15 values, Warn above BEP, and new **"Max SL for cards with a CANDLE SL"** (`candle_max_sl`, default 17, 0 = none). `Engine.save_order_defaults`.
+   - **`positions.py`** (`PositionManager`, state `bk` = JSON in the orders file, new columns `bk`, `ik`, `filled_qty`):
+     - Entry = market BUY (market protection), tag `BEP-hhmmss-n` (`Engine.place_entry`; Pause algo, and for Sandbox / Live the daily limit apply).
+     - After the fill (order book every 2 s, `broker.order_book()`, one call): an **SL-M SELL** at the exchange. Trigger: LTP rule = value, POINT = fill − value, CANDLE-only = fill − `candle_max_sl`; 09:15 order = fill − `open_max_sl` (its candle SL stays app-watched). Already below the SL → exit at once.
+     - SL not placed: retried every 2 s, the 2nd and 3rd try as an **SL limit** (limit = trigger − `AUTO_ORDER_SL_LIMIT_GAP` 5); after 3 tries **NO SL** alert (toast, notification, red chip); the user decides (Square off). An SL-M **rejected** later → re-placed as SL limit.
+     - **Trailing** (decision 4's rule, card trail or Setup) modifies the SL trigger up, at most once per 2 s, never down.
+     - **Exits** (target LTP / POINT on the live LTP; CANDLE SL / target via `trade_tracker` `custom_hit`; Pair opponent; Square off / Square off all, **this order only**; 15:15 `EOD_EXIT_TIME`): the SL order is **modified to MARKET**; without one, a market SELL. Exit failing 3 times → "EXIT FAILED" alert. An unfilled entry is cancelled at 15:15 / on an exit request.
+     - The SL order filling = exit "SL" or "Trailing SL" (trigger above the first one).
+     - **Editing after placing** replaces the rule: LTP / POINT SL moves the exchange SL (also down: the user's choice), CANDLE → app rule + max SL; Target LTP / POINT / CANDLE / None; trail → moves the SL.
+     - **Sandbox** (no order status): entry assumed filled at the LTP, an accepted exit assumed filled at the LTP, the SL assumed hit when LTP ≤ trigger, so the calls can be tried end to end.
+     - **Dry run:** the paper broker, moved by the 2 s LTP (replaces the 1-min candle simulation for new orders). After a restart it has forgotten its orders: a filled entry stays, a lost SL order is placed again (IDs `PAPER-hhmmss-n`).
+     - **Restart:** positions resume from the orders file; any filled position without a live SL gets one on the next tick. Positions placed in another mode are left alone (switch back to manage them).
+     - Card chips: `ORDERED · SL 135.00`, `ORDERED · SENT · waiting for the fill`, `EXITING · Target`, `NO SL`, `EXIT FAILED`, `EXITED · Target / SL / Trailing SL / Candle SL / Opponent SL / Manual square-off / 15:15`. Order Details SL / Target column adds `positions.summary` (e.g. "SL-M 135.00 at the exchange").
+   - **Limit / Stop-limit** are refused at ⚡ until PR 4 (the forms still show them; use Strategy / Market / Price).
+   - Checked (24 Nov): 38 unit tests (`tests/test_brokers.py`, `tests/test_positions.py`), and the real engine in Dry run with stubbed data: fill 152 → SL-M 135 → trail 155 / 165 → target 202 → SL to MARKET → exit 203, P&L ₹3,315; a 2-lot card → square-off of that order only; a restart re-placing the lost SL. **Not yet tested:** Sandbox / Live (needs a trading day, the sandbox token, and for Live the static IP).
+
 ## Inherited from BEP-AlgoDelta (up to its PR #49)
-Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-AlgoDelta** PRs. Parts that mention AlgoDelta JSON, `order_bridge.py`, webhooks or "AlgoDelta holds the SL" are what PRs 2–4 here replace; update them as each PR lands.
+Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-AlgoDelta** PRs. **Since PR 3 here, every mention of AlgoDelta JSON, `order_bridge.py`, webhooks, `squareoff_position` / `cancel_order` or "AlgoDelta holds the SL / Target / trail" is replaced by decision 6 above** (the BEP logic, triggers, warnings and screens still apply). The Limit / Stop-limit parts come back in PR 4.
 ## Architecture (after PR #3)
 - `engine.py`: **one background engine** for the whole app (`app.timer`). It handles the Upstox connection, scans, the 09:15 order, Order Management, orders, tracking, log and alerts. Pages only read its state; version counters trigger redraws, and events trigger toasts and browser notifications in every tab.
 - `app.py`: NiceGUI **single-page app** (`ui.sub_pages`), dark theme with a toggle, a header (LTP, status, Upstox ✓, DRY RUN/LIVE, Pause alerts, Pause algo) and a left nav. The pages are:
@@ -93,8 +113,9 @@ Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-
 - `pair_cross.py`: BEP Pair cross table (decision 25), run by `BepMonitor._cross_step` on the board's candles.
 - `replay.py`: Replay a past day (a separate `BepMonitor` with `replay=True`, historical candles through `ReplayClient`).
 - `common_watch.py`: Order Management rows (Same strike, Pair, ⭐, Manual Entry).
-- `order_bridge.py`: AlgoDelta JSON: `strategy_order`, `limit_order`, `squareoff_position` and `cancel_order`.
-- `brokers/` (BEP Upstox PR 2): the broker layer (`base.py` interface, `upstox.py`, `paper.py`, `create()` in `__init__.py`); see "BEP Upstox decisions".
+- ~~`order_bridge.py`~~ (AlgoDelta JSON): **removed in BEP Upstox PR 3.**
+- `brokers/` (BEP Upstox PR 2): the broker layer (`base.py` interface incl. `order_book()`, `upstox.py`, `paper.py`, `create()` in `__init__.py`); see "BEP Upstox decisions".
+- `positions.py` (BEP Upstox PR 3): broker-held positions (entry → exchange SL → trail → exit); see decision 6.
 - `limit_orders.py`: Manual Entry Limit mode helpers (state in the order row's `mg` column, app SL/Target/trail checks, Upstox order-book matching).
 - `trade_tracker.py`: Order Details Entry/Exit/LTP/Points/P&L. Live orders use Upstox fills (FIFO per order); dry run is simulated.
 - `exit_rules.py`: one evaluator for SL/Target rules on 1-min candles (LTP / POINT / CANDLE, trailing SL, 15:15 exit).
@@ -335,7 +356,7 @@ Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-
      - At ⚡: "Check before placing" adds "Target is None and the trailing SL is OFF: this order exits only by the SL, a manual square-off or 15:15" when the card's trail is off.
      - The 09:15 order is unchanged (Setup target).
 
-## AlgoDelta JSON used
+## AlgoDelta JSON used (BEP-AlgoDelta only; not used here since PR 3)
 - Entry `strategy_order`: the template in `config._STRATEGY_ORDER`, with placeholders `{symbol}` (e.g. NIFTY23NOV2625400CE), `{qty}`, `{tgt}`, `{sl}`, `{is_trail}`, `{trail_*}`, `{exit_on_opposite}` and others.
 - Limit entry: `{"type": "limit_order", "script_type": "CE", "script": "NIFTY23NOV2625200CE", "product": "INTRADAY", "quantity": 1, "price": 100, "transaction_type": "BUY"}` (quantity = lots).
 - Stop-limit entry (PR #36): `{"type": "sl_order", "script_type": "CE", "script": "NIFTY23NOV2625650CE", "product": "INTRADAY", "quantity": 1, "price": 150, "trigger_price": 150, "transaction_type": "BUY"}` (quantity = lots; the app sends price = the limit, trigger_price = the trigger).
@@ -343,10 +364,10 @@ Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-
 - Square-off: `{"type": "squareoff_position", "script_type": "CE", "script": "NIFTY23NOV2625300CE", "product": "INTRADAY"}`.
 - AlgoDelta has **no modify-SL/Target syntax** (and no modify-order syntax) and no public read API (positions/fills), so live P&L comes from Upstox.
 
-## Daily checklist (user)
-1. Before 09:08: start the app. On Setup, enter today's Upstox token and upload the BEP CSV; the AlgoDelta settings are already saved.
-2. AlgoDelta: the broker (Upstox) is logged in for the day and the **Trading** toggle is ON.
-3. For live trading: the webhook is set, "I checked this JSON" is ticked and saved, Dry run is OFF and the header shows LIVE. Keep the PC awake from 09:08 to 09:20.
+## Daily checklist (user, BEP Upstox)
+1. Before 09:08: start the app. On Setup, enter today's Upstox token and upload the BEP CSV; the order defaults are already saved.
+2. Choose the order mode on Setup › Broker orders: Dry run (default), Sandbox (sandbox token saved) or Live (static IP registered in the Upstox app). The header shows DRY RUN / SANDBOX / LIVE.
+3. Keep the app running (PC, later the cloud server): the SL is at the exchange, but trailing, the target, candle SLs and 15:15 need the app.
 4. Add Order Management rows before 09:15 if you want first-candle triggers.
 
 ## Open / not yet verified
