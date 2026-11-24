@@ -249,6 +249,9 @@ def root():
         mode_badge = ui.badge("").props("rounded")
         app_sl_badge = ui.badge("").props("rounded color=red-9").classes("text-sm px-2 py-1")
         app_sl_badge.tooltip("Limit orders: the SL / Target are watched by this app - keep this PC on and the app running")
+        loss_badge = ui.badge("").props("rounded color=red-9").classes("text-sm px-2 py-1")
+        loss_badge.tooltip("Max loss per day (Dry run orders, closed + open P&L): new orders ask first; a PENDING "
+                           "card that fires is not placed; the 09:15 order is not affected")
         alerts_badge = ui.badge("ALERTS PAUSED").props("rounded color=red")
         alert_btn = ui.button("", on_click=engine.toggle_alerts).props("dense no-caps")
         algo_btn = ui.button("", on_click=engine.toggle_algo_pause).props("dense no-caps")
@@ -279,6 +282,9 @@ def root():
         app_sl_badge.set_text(" · ".join(([f"APP-MANAGED SL ACTIVE ({la['held']}) - keep this PC on"] if la["held"] else [])
                                          + ([f"LIMIT OPEN ({la['waiting']})"] if la["waiting"] else [])))
         app_sl_badge.set_visibility(bool(la["held"] or la["waiting"]))
+        ml = engine.max_loss_state(names[0] if names else None)
+        loss_badge.set_text(f"MAX LOSS ₹{ml['loss']:,.0f} / {ml['limit']:,.0f}")
+        loss_badge.set_visibility(ml["hit"])
         alerts_badge.set_visibility(config.ALERTS_PAUSED)
         alert_btn.set_text("Resume alerts" if config.ALERTS_PAUSED else "Pause alerts")
         alert_btn.props("icon=" + ("notifications_active color=green" if config.ALERTS_PAUSED
@@ -1824,6 +1830,15 @@ def make_place(name):
         r = engine.watches[name].get(row_id)
         if not r:
             return
+        if engine.max_loss_state(name)["hit"] and not r.get("loss_ok"):   # max loss per day: asks first
+            def anyway():
+                engine.ack_max_loss(name, row_id)
+                return place(row_id)
+            confirm_warnings("Max loss per day reached",
+                             [engine.max_loss_text(name),
+                              "Place this order anyway? (Setup › Order defaults › Max loss per day; 0 = off)"],
+                             anyway, "Place anyway")
+            return
 
         async def do():
             if r.get("entry_mode") == "limit":
@@ -2736,6 +2751,11 @@ def order_defaults_card(name):
                                         value=ad_cfg.get("warn_above_bep", 10), min=0, step=1).classes("w-full") \
                     .tooltip("BEP Support \u2b50, BEP cross Pair and Manual Entry cards: 'Check before placing' "
                              "shows the LTP - BEP difference")
+                ad_max_loss = ui.number("Max loss per day (₹, 0 = off; Dry run only for now)",
+                                        value=ad_cfg.get("max_loss_day", 2000), min=0, step=100).classes("w-full") \
+                    .tooltip("Today's closed + open P&L of the Dry run orders. Once the loss reaches this: \u26a1 / "
+                             "Add & place ask first, a PENDING card that fires is not placed, open positions are "
+                             "left alone. The 09:15 order is not affected.")
         ad_status = ui.label("").classes("text-sm")
         ui.button("Save", icon="save", on_click=lambda: save())
 
@@ -2757,6 +2777,9 @@ def order_defaults_card(name):
         warn_bep = num(ad_warn_bep.value)
         if warn_bep is None or warn_bep < 0:
             return None, "Warn above BEP must be a number of 0 or more (0 = off)."
+        max_loss = num(ad_max_loss.value)
+        if max_loss is None or max_loss < 0:
+            return None, "Max loss per day must be a number of 0 or more (0 = off)."
         open_entry, open_sl = num(ad_open_entry.value), num(ad_open_sl.value)
         if open_entry is None or open_sl is None or open_entry < 0 or open_sl < 0:
             return None, "09:15 entry above BEP and SL below BEP must be numbers of 0 or more."
@@ -2774,6 +2797,7 @@ def order_defaults_card(name):
                 "trail": trail, "max_above_bep": max_above, **defaults,
                 "open_entry_above": open_entry, "open_sl_below": open_sl, "open_sl_tf": int(ad_open_tf.value or 5),
                 "open_max_sl": open_max, "candle_max_sl": candle_max, "warn_above_bep": warn_bep,
+                "max_loss_day": max_loss,
                 "trail_trigger": t_trig if t_trig is not None else ad_cfg.get("trail_trigger", 20),
                 "trail_point": t_point if t_point is not None else ad_cfg.get("trail_point", 1),
                 "trail_gap": t_gap if t_gap is not None else ad_cfg.get("trail_gap", 20)}, ""
@@ -2790,6 +2814,9 @@ def order_defaults_card(name):
                            f"pair {nums['tgt_pair']:g}, \u2b50 {nums['tgt_star']:g}, manual {nums['tgt_manual']:g}), "
                            f"SL {nums['sl']} ({nums['sl_type']}), qty {nums['qty']}; {trail_txt}; "
                            f"CANDLE-SL cards: max SL {nums['candle_max_sl']:g} pts at the exchange; "
+                           + (f"max loss per day ₹{nums['max_loss_day']:,.0f} (Dry run); " if nums['max_loss_day']
+                              else "max loss per day OFF; ")
+                           + 
                            f"09:15 order at LTP >= BEP + {nums['open_entry_above']:g} and < BEP + {nums['max_above_bep']}, "
                            f"SL = {nums['open_sl_tf']}-min close below BEP - {nums['open_sl_below']:g} (app)"
                            + (f", max SL {nums['open_max_sl']:g} pts (exchange)." if nums['open_max_sl'] else "."))

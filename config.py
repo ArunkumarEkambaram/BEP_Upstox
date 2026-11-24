@@ -115,6 +115,10 @@ def _default_auto_order() -> dict:
         # ⚡ on a BEP card (⭐ / BEP cross Pair / Manual Entry): "Check before placing" when the LTP (or the limit
         # price) is more than this many points above the strike's BEP (PR #43; 0 = off)
         "warn_above_bep": 10,
+        # Max loss per day (₹, 0 = off; DRY RUN orders only for now): once today's closed + open P&L of the
+        # dry-run orders is a loss of this much, ⚡ asks first and a PENDING card that fires later is not placed.
+        # The automatic 09:15 order is never stopped by it.
+        "max_loss_day": 2000,
         # default targets per Order Management type (the 09:15 opening order uses "tgt" / "tgt_type");
         # each row can override value and type until it is ordered
         "tgt_same": 50, "tgt_pair": 50, "tgt_star": 50, "tgt_manual": 50,
