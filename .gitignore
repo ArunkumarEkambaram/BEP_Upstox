@@ -1,0 +1,6 @@
+__pycache__/
+settings.json
+settings.json.tmp
+orders_*.csv
+common_watch_*.json
+upstox_token.json
