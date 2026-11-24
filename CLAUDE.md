@@ -1,6 +1,6 @@
 # CLAUDE.md: BEP Upstox project context (read at the start of every session)
 
-Repo: `ArunkumarEkambaram/BEP_Upstox` (default branch `master`, latest merge = PR #7; updated together with each feature PR).
+Repo: `ArunkumarEkambaram/BEP_Upstox` (default branch `master`, latest merge = PR #9, docs: the 09:15 second-side window to port later; updated together with each feature PR).
 Run: `python app.py` → http://localhost:**8084** (`config.APP_PORT`). Needs `nicegui>=3.1.0`, Python 3.14 on the user's PC. Cloud server: `deploy/README.md` (PR 5).
 **What it is:** a copy of `ArunkumarEkambaram/BEP-AlgoDelta` (`main` at its PR #49, full history kept) that will send orders **directly to Upstox** (with a registered static IP, later on a cloud server) instead of through AlgoDelta. The BEP logic (Support board, ⭐, Pair cross, Replay, Order Management triggers, exit rules, Order Details) stays the same; the order path is replaced.
 Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until this one is proven live; port 8083; important BEP-logic fixes are ported to **both** apps until one is retired), `ArunkumarEkambaram/LTP_Crossing` (reference only, do not change).
