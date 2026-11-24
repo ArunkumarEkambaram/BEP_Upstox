@@ -36,7 +36,6 @@ ORDER_FILE_COLUMNS = ["id", "time", "index", "opt", "strike", "kind", "bep", "lt
                       "expiry", "qty", "exit", "exit_time", "exit_reason", "c_sl", "c_tgt", "c_done", "sq", "mg", "c_trail",
                       "bk", "ik", "filled_qty"]
 ORDER_LOCKED = ("SENT", "DRY RUN", "sending")
-LIMIT_ORDERS_READY = False        # BEP Upstox: Limit / Stop-limit move to the broker layer in PR 4
 ORDER_STATUS = {"dry_run": "DRY RUN", "sent": "SENT", "failed": "FAILED", "blocked": "BLOCKED"}
 _LOCKING_STATUS = {"SENT": "sent", "DRY RUN": "dry_run", "FAILED": "failed"}
 
@@ -547,7 +546,7 @@ class Engine:
         self.bump("watch")
 
     def set_watch_mode(self, name, row_id, mode) -> bool:
-        """Card order type: "limit" (AlgoDelta limit_order, app SL / Target) or None (strategy_order)."""
+        """Card order type: "limit" (LIMIT or, with a trigger, SL BUY at the exchange) or None (market entry)."""
         ok = self.watches[name].set_mode(row_id, mode)
         if ok:
             r = self.watches[name].get(row_id)
@@ -577,7 +576,7 @@ class Engine:
 
     @staticmethod
     def is_stop(r) -> bool:
-        """Stop-limit card (AlgoDelta sl_order): Manual with a trigger, or a card in Stop-limit mode."""
+        """Stop-limit card (SL BUY): Manual with a trigger, or a card in Stop-limit mode."""
         return r.get("entry_mode") == "limit" and bool(r.get("entry_trigger") or r.get("entry_stop"))
 
     @staticmethod
@@ -647,8 +646,7 @@ class Engine:
                 if c["status"] == "watching":
                     wanted.update({(name, c["up"]["strike"], c["up"]["opt"]), (name, c["dn"]["strike"], c["dn"]["opt"])})
         for o in self.order_log:                     # limit orders / app trails keep their live LTP without a card
-            m = limit_orders.parse(o.get("mg"))
-            if o.get("index") in self.monitors and ((m and limit_orders.pending(m)) or self.is_open(o)):
+            if o.get("index") in self.monitors and (self.entry_open(o) or self.is_open(o)):
                 wanted.add((o["index"], int(float(o["strike"])), o["opt"]))
         if not wanted:
             return
@@ -696,7 +694,7 @@ class Engine:
             if r["status"] not in ("failed", "exited"):
                 continue
             o = self.row_order(r)
-            if o is not None and limit_orders.cancellable(limit_orders.parse(o.get("mg"))):
+            if o is not None and self.entry_cancellable(o):
                 await self.cancel_limit(o["id"], f"card {r['status'].upper()}")
 
     async def delete_watch(self, name, row_id):
@@ -704,7 +702,7 @@ class Engine:
         pending entry simply stops. A placed order stays in Order Details (its app SL / Target keep running)."""
         r = self.watches[name].get(row_id)
         o = self.row_order(r) if r else None
-        if o is not None and limit_orders.cancellable(limit_orders.parse(o.get("mg"))):
+        if o is not None and self.entry_cancellable(o):
             await self.cancel_limit(o["id"], "Card deleted")
         self.remove_watch(name, row_id)
 
@@ -858,7 +856,7 @@ class Engine:
             await self.check_app_trails()
             await self.broker_tick()
 
-    async def place_watch_order(self, name, row_id, fill_ltp=None, entry_note=""):
+    async def place_watch_order(self, name, row_id, fill_ltp=None, entry_note="", entry=None):
         """Sends the card's order now (market). Signal LTP = the live LTP at the click / at the price hit (dry-run
         Entry uses it), falling back to the last candle close when no live LTP is known yet."""
         cw, mon = self.watches[name], self.monitors[name]
@@ -868,6 +866,8 @@ class Engine:
         kind = {"star": "star", "pair": "pair", "manual": "manual"}.get(r.get("source"), "common")
         label = {"star": "Manual — ⭐ support", "pair": "Manual — pair",
                  "common": "Manual — common price", "manual": "Manual entry"}[kind]
+        if entry:                                     # PR 4: Limit / Stop-limit entry
+            label += " — stop-limit" if entry.get("type") == bk.SL else " — limit"
         ltp = next((v for v in (fill_ltp, self.row_live_ltp(name, r), r["last_close"], r["trig_close"])
                     if v is not None), None)
         if ltp is None:                               # e.g. a Manual Entry card placed right after adding
@@ -902,7 +902,7 @@ class Engine:
                "ltp": ltp,
                "entry_note": entry_note,
                "expiry": mon.expiry, "order_type": "strategy_order", "kind": kind,
-               "kind_label": label, "time": _stamp(), "params": params, "app_rules": app_rules}
+               "kind_label": label, "time": _stamp(), "params": params, "app_rules": app_rules, "entry": entry}
         r["pending"] = None
         cw.set_order_status(row_id, "sending")
         self.bump("watch")
@@ -1280,12 +1280,21 @@ class Engine:
         if not ik:
             return {"status": "failed", "message": f"ORDER FAILED {head}: {err}", "payload": payload,
                     "detail": err}
-        st = positions.new_state(mode, tag, ik, units, plan, float(sig["ltp"]), sig.get("kind", ""))
-        req = bk.OrderRequest(ik, bk.BUY, units, bk.MARKET, tag=tag, symbol=f"{name} {int(sig['strike'])} {sig['opt']}",
-                              ref_price=float(sig["ltp"]))
+        ent = sig.get("entry") or {}
+        etype = ent.get("type") or bk.MARKET
+        eprice, etrig = float(ent.get("price") or 0), float(ent.get("trigger") or 0)
+        payload.update(order_type=etype, price=eprice or None, trigger_price=etrig or None)
+        st = positions.new_state(mode, tag, ik, units, plan, float(sig["ltp"]), sig.get("kind", ""),
+                                 etype=etype, eprice=eprice, etrig=etrig)
+        ref = float(sig["ltp"])
+        if mode == "dry" and etype != bk.MARKET and not market_utils.is_market_open():
+            ref = None                                # a stale pre-open LTP must not fill a dry-run limit
+        req = bk.OrderRequest(ik, bk.BUY, units, etype, price=eprice, trigger_price=etrig, tag=tag,
+                              symbol=f"{name} {int(sig['strike'])} {sig['opt']}", ref_price=ref)
         res = await run.io_bound(self._manager().place_entry, st, req, _stamp())
         label = brokers.MODE_LABELS[mode].upper()
-        plan_txt = (f"SL {positions.sl_trigger(plan, float(sig['ltp'])) or '-'} at the exchange after the fill"
+        plan_txt = (("SL" if etype == bk.MARKET else "SL (from the fill)") +
+                    f" {positions.sl_trigger(plan, eprice or float(sig['ltp'])) or '-'} at the exchange after the fill"
                     + (f", target {positions.target_level(plan, float(sig['ltp']))}" if plan.get("tgt") else
                        ", no target")
                     + (f", trail {plan['trail']['trigger']:g}/{plan['trail']['gap']:g}" if plan.get("trail") else ""))
@@ -1309,6 +1318,20 @@ class Engine:
             self._rewrite_orders_file()
             self.bump("orders", "watch")
         return ok
+
+    def entry_open(self, o) -> bool:
+        """The order's Limit / Stop-limit entry still waits (or is partly filled) at the exchange."""
+        st = self._bk(o)
+        if st:
+            return st.get("etype", bk.MARKET) != bk.MARKET and positions.entry_open(st)
+        m = limit_orders.parse(o.get("mg"))
+        return bool(m) and limit_orders.pending(m)
+
+    def entry_cancellable(self, o) -> bool:
+        st = self._bk(o)
+        if st:
+            return self.entry_open(o) and not st.get("cancel_req") and st.get("mode") == config.BROKER_MODE
+        return limit_orders.cancellable(limit_orders.parse(o.get("mg")))
 
     def _card_for_order(self, o):
         cw = self.watches.get(o.get("index"))
@@ -1360,6 +1383,14 @@ class Engine:
                 self.log(f"{what}: EXIT {ev['reason']} @ {ev['price']}.")
                 self.notify(f"{o['index']} {o['strike']}{o['opt']}: exit {ev['reason']} @ {ev['price']}",
                             "info", f"{o['index']} exit {o['strike']}{o['opt']}")
+            elif kind == "cancelled":
+                o["status"] = "CANCELLED"
+                o["detail"] = f"{o.get('detail', '')} | {ev['text']}".strip(" |")
+                card = self._card_for_order(o)
+                if card:
+                    self.watches[o["index"]].set_order_status(card["id"], "CANCELLED")
+                self.log(f"{what}: {ev['text']}.")
+                self.notify(f"{o['index']} {o['strike']}{o['opt']}: {ev['text']}", "info")
             elif kind == "failed":
                 o["status"] = "FAILED"
                 o["detail"] = f"{o.get('detail', '')} | {ev['text']}".strip(" |")
@@ -1517,6 +1548,11 @@ class Engine:
         """Counts for the header banner: limit orders waiting at the exchange / positions protected by the app."""
         waiting = held = 0
         for o in self.order_log:
+            st = self._bk(o)
+            if st:                                    # broker position: its SL is at the exchange
+                if self.entry_open(o) and st.get("fill") is None:
+                    waiting += 1
+                continue
             m = limit_orders.parse(o.get("mg"))
             if m and limit_orders.pending(m) and not limit_orders.held(m):
                 waiting += 1
@@ -1525,77 +1561,61 @@ class Engine:
         return {"waiting": waiting, "held": held}
 
     async def place_limit_order(self, name, row_id):
-        """Sends the card's AlgoDelta limit_order (BUY at its price). The SL / Target / trailing SL are kept on the
-        order row and watched by the app (check_limits). Pause algo / dry run / the daily limit apply."""
-        cw, mon = self.watches[name], self.monitors[name]
+        """⚡ on a Limit / Stop-limit card (PR 4): a LIMIT BUY at the card's price, or an SL BUY (stop-limit:
+        waits at the exchange until the LTP rises to the trigger, then a limit). After the fill it is the same
+        position as a market entry: exchange SL, trailing, target, exits (positions.py)."""
+        cw = self.watches[name]
         r = cw.get(row_id)
         if not r or r["status"] != "triggered" or r.get("order_status") in ORDER_LOCKED:
-            return None
-        if not LIMIT_ORDERS_READY:
-            self.notify(f"{name} {r['strike']}{r['opt']}: Limit / Stop-limit orders come in BEP Upstox PR 4 - "
-                        "use Strategy (market) for now.", "warning")
-            self.log(f"{name} {r['strike']}{r['opt']}: Limit / Stop-limit not available yet (PR 4); not sent.")
             return None
         price = self.limit_price(r)
         if not price:
             self.notify(f"{name} {r['strike']}{r['opt']}: set the limit price first.", "warning")
             return None
+        trigger = self.stop_prices(r)[0]
         ltp = self.row_live_ltp(name, r)
         if ltp is None:
             ltp = await self.quote_option(name, r["strike"], r["opt"])
-        trigger = self.stop_prices(r)[0]                    # stop-limit (sl_order), any card
-        sl, tgt, trail, app_rules = self._limit_rules(name, r)
-        lots = self.row_qty(name, r)
-        t = _stamp()
-        kind = {"star": "star", "pair": "pair", "manual": "manual"}.get(r.get("source"), "common")
-        label = {"star": "Manual — ⭐ support", "pair": "Manual — pair",
-                 "common": "Manual — common price", "manual": "Manual entry"}[kind]
-        sig = {"index": name, "opt": r["opt"], "strike": r["strike"], "price": price, "bep": price,
-               "ltp": float(ltp if ltp is not None else price),
-               "entry_note": (f"STOP-LIMIT trigger {trigger:.2f} limit {price:.2f}" if trigger else f"LIMIT {price:.2f}")
-               + (f", LTP {ltp:.2f} at the click" if ltp is not None else ""),
-               "expiry": mon.expiry, "order_type": "sl_order" if trigger else "limit_order", "kind": kind,
-               "kind_label": label + (" — stop-limit" if trigger else " — limit"), "time": t, "params": {"qty": lots},
-               "app_rules": app_rules, "trigger": trigger}
-        r["pending"] = None
-        cw.set_order_status(row_id, "sending")
-        self.bump("watch")
-        res = {"status": "failed", "message": "limit orders come in PR 4", "payload": {}, "detail": "PR 4"}
-        if res["status"] in ("sent", "dry_run"):
-            m = {"price": price, "units": lots * config.INDEXES[name]["lot_size"], "state": "OPEN",
-                 "msg": "Sent, waiting for the fill", "sent_at": t, "oid": None, "filled": 0, "fill": None,
-                 "fill_time": "", "sl": sl, "tgt": tgt, "trail": trail, "high": None, "cancel_ts": None, "exit": ""}
-            if trigger:
-                m.update(trigger=trigger, triggered=False,
-                         msg=f"Sent, waiting at the exchange for the trigger {trigger:.2f}")
-            if res["status"] == "dry_run":
-                if not market_utils.is_market_open():     # a stale pre-open LTP must not fill it
-                    m["msg"] = "Dry run: market not open yet - waits for 09:15, then fills at or below the price"
-                elif limit_orders.dry_fill(m, ltp, t):    # marketable limit: fills at once, near the LTP
-                    m["msg"] = f"Filled at once at {m['fill']:.2f} (dry run; the LTP was already below the limit)"
-                elif trigger and not m.get("triggered"):
-                    m["msg"] = f"Dry run: waits for the LTP to rise to {trigger:.2f}, then a limit at {price:.2f}"
-                else:
-                    m["msg"] = "Dry run: fills when the LTP is at or below the price"
-            sig["mg"] = limit_orders.dump(m)
-        cw.set_order_status(row_id, ORDER_STATUS.get(res["status"], res["status"]))
-        self.log(res["message"])
-        self.add_order_row(sig, res)
-        r["order_id"] = self.order_log[-1]["id"]
-        cw.save()
-        self.bump("watch")
-        st = ORDER_STATUS.get(res["status"], res["status"].upper())
-        if not market_utils.is_market_open():
-            st += " (market not open yet: the limit waits for 09:15)"
-        self.notify(f"{name} {r['strike']}{r['opt']}: "
-                    + (f"STOP-LIMIT {trigger:.2f} → {price:.2f} " if trigger else f"LIMIT {price:.2f} ") + st
-                    + (" - SL / Target are watched by the app (keep this PC on)." if res["status"] in ("sent", "dry_run")
-                       else f" - {res['detail']}"),
-                    {"sent": "positive", "dry_run": "info"}.get(res["status"], "negative"),
-                    f"{name} limit {r['strike']}{r['opt']}")
+        if trigger and ltp is not None and ltp >= trigger:
+            self.notify(f"{name} {r['strike']}{r['opt']}: the LTP {ltp:.2f} is already at or above the trigger "
+                        f"{trigger:.2f} - raise the trigger, or use Limit / Market.", "warning")
+            return None
+        entry = {"type": bk.SL if trigger else bk.LIMIT, "price": float(price), "trigger": float(trigger or 0)}
+        note = (f"STOP-LIMIT trigger {trigger:.2f} limit {price:.2f}" if trigger else f"LIMIT {price:.2f}") + (
+            f", LTP {ltp:.2f} at the click" if ltp is not None else "")
+        res = await self.place_watch_order(name, row_id, fill_ltp=ltp, entry_note=note, entry=entry)
+        if res:
+            st = ORDER_STATUS.get(res["status"], res["status"].upper())
+            if res["status"] == "dry_run" and not market_utils.is_market_open():
+                st += " (market not open yet: the dry-run limit waits for 09:15)"
+            self.notify(f"{name} {r['strike']}{r['opt']}: "
+                        + (f"STOP-LIMIT {trigger:.2f} → {price:.2f} " if trigger else f"LIMIT {price:.2f} ") + st
+                        + ("" if res["status"] in ("sent", "dry_run") else f" - {res['detail']}"),
+                        {"sent": "positive", "dry_run": "info"}.get(res["status"], "negative"),
+                        f"{name} limit {r['strike']}{r['opt']}")
         return res
 
     async def cancel_limit(self, order_id, reason="Cancelled by you"):
+        """Cancels THIS order's unfilled Limit / Stop-limit entry by its order ID (a filled part stays, with its
+        exchange SL). Done on the next 2 s tick. Old AlgoDelta rows (mg) can't be cancelled from here."""
+        o = next((x for x in self.order_log if x["id"] == order_id), None)
+        st = self._bk(o)
+        if st:
+            if not self.entry_cancellable(o) or not positions.PositionManager.request_cancel(st, reason):
+                return None
+            filled = st.get("fill") is not None
+            self.log(f"{o['index']} {o['strike']}{o['opt']} #{o['id']}: cancel requested ({reason})"
+                     + (f"; {st['fill_qty']} filled stay, with the exchange SL." if filled else "."))
+            self.notify(f"{o['index']} {o['strike']}{o['opt']}: cancelling the "
+                        + ("unfilled rest" if filled else "limit order") + f" ({reason})", "info",
+                        f"{o['index']} cancel {o['strike']}{o['opt']}")
+            o["detail"] = f"{o.get('detail', '')} | Cancel ({reason}) {_stamp()}".strip(" |")
+            self._rewrite_orders_file()
+            self.bump("orders", "watch")
+            return {"status": "sent", "message": "cancel requested"}
+        return await self._cancel_old_limit(order_id, reason)
+
+    async def _cancel_old_limit(self, order_id, reason="Cancelled by you"):
         """Sends AlgoDelta cancel_order for a limit order still open at the exchange (or CANCEL FAILED: retry).
         Live: CANCEL SENT, then the Upstox order book confirms it (else CANCEL FAILED after
         LIMIT_CANCEL_CONFIRM_SECONDS). Dry run: CANCELLED at once. Not blocked by Pause algo / the daily limit."""

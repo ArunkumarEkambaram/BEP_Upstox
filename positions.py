@@ -32,10 +32,14 @@ EXIT_TRIES = 3            # attempts to get an exit order accepted, then an aler
 MODIFY_EVERY = 2.0        # seconds between two trailing modifies of one SL order
 
 
-def new_state(mode: str, tag: str, ik: str, units: int, plan: dict, ref_price, kind: str = "") -> dict:
+def new_state(mode: str, tag: str, ik: str, units: int, plan: dict, ref_price, kind: str = "",
+              etype: str = bk.MARKET, eprice: float = 0.0, etrig: float = 0.0) -> dict:
     """plan = {"sl": {"type": "LTP"|"POINT", "value"} | None, "max_sl": points | None,
-               "tgt": {"type": "LTP"|"POINT", "value"} | None, "trail": {"trigger", "gap", "step"} | None}"""
+               "tgt": {"type": "LTP"|"POINT", "value"} | None, "trail": {"trigger", "gap", "step"} | None}
+    etype = the entry order: MARKET, LIMIT (eprice) or SL = stop-limit BUY (etrig -> limit eprice), PR 4."""
     return {"mode": mode, "tag": tag, "ik": ik, "units": int(units), "plan": plan, "ref": ref_price, "kind": kind,
+            "etype": etype, "eprice": float(eprice or 0), "etrig": float(etrig or 0), "triggered": False,
+            "cancel_req": "", "cancel_sent": 0, "sl_qty": 0,
             "entry_id": "", "entry_st": "", "fill": None, "fill_qty": 0, "fill_time": "",
             "sl_id": "", "sl_st": "", "sl_trg": None, "sl_first": None, "sl_kind": bk.SLM, "sl_tries": 0,
             "sl_reset": False, "high": None, "trail_at": 0.0,
@@ -74,6 +78,25 @@ def trail_level(trail: dict, entry, high):
     return bk.round_tick(entry + int((high - float(trail["gap"]) - entry) // step) * step)
 
 
+def entry_open(st) -> bool:
+    """The entry order can still (partly) fill: sent, not complete / cancelled / rejected."""
+    return bool(st) and bool(st.get("entry_id")) and not st.get("closed") and st.get("entry_st") not in bk.FINAL
+
+
+def entry_text(st) -> str:
+    """Chip text of an unfilled / partly filled Limit or Stop-limit entry ('' for a market entry)."""
+    et = st.get("etype", bk.MARKET)
+    if et == bk.MARKET or not entry_open(st):
+        return ""
+    if st.get("fill") is not None:
+        return f"FILLED {st['fill_qty']} @ {st['fill']:.2f} · PARTIAL"
+    if st.get("cancel_req"):
+        return "CANCELLING"
+    if et == bk.SL and not st.get("triggered"):
+        return f"STOP @ {st['etrig']:.2f} → LIMIT {st['eprice']:.2f}"
+    return f"LIMIT OPEN @ {st['eprice']:.2f}"
+
+
 def is_open(st) -> bool:
     return bool(st) and st.get("fill") is not None and not st.get("closed")
 
@@ -109,7 +132,7 @@ class PositionManager:
         res = self.broker.place(req)
         if res.ok:
             st["entry_id"], st["entry_st"] = res.order_id, bk.SENT
-            if self.assumed:
+            if self.assumed and st.get("etype", bk.MARKET) == bk.MARKET:
                 self._filled(st, req.ref_price, req.quantity, now_text, [])
         else:
             st["entry_st"], st["closed"] = bk.REJECTED, "entry not placed"
@@ -121,6 +144,15 @@ class PositionManager:
         if not st or st.get("closed") or st.get("exit_req"):
             return False
         st["exit_req"], st["exit_req_time"] = reason, now_text
+        return True
+
+    @staticmethod
+    def request_cancel(st: dict, reason: str) -> bool:
+        """Cancels the unfilled entry (or the unfilled rest of a partly filled limit); a filled part stays,
+        protected by its exchange SL."""
+        if not entry_open(st) or st.get("cancel_req"):
+            return False
+        st["cancel_req"] = reason
         return True
 
     @staticmethod
@@ -182,34 +214,85 @@ class PositionManager:
         st["sl_trg"] = None
         self._ev(events, key, "fill", price=st["fill"], qty=st["fill_qty"], time=now_text)
 
+    def _fill_update(self, st, price, qty, now_text, events, key):
+        if st.get("fill") is None:
+            status = st.get("entry_st")
+            self._filled(st, price, qty, now_text, events, key)
+            st["entry_st"] = status                       # a partly filled limit keeps watching for the rest
+            return
+        st.update(fill=round(float(price), 2), fill_qty=int(qty))
+        self._ev(events, key, "fill", price=st["fill"], qty=st["fill_qty"], time=now_text)
+
+    def _entry_req(self, st):
+        et = st.get("etype", bk.MARKET)
+        return bk.OrderRequest(self._ik(st), bk.BUY, int(st["units"]), et,
+                               price=st.get("eprice") or 0.0, trigger_price=st.get("etrig") or 0.0, tag=st["tag"],
+                               ref_price=None)
+
+    def _assume_entry(self, st, ltp, now_text, events, key):
+        """Sandbox (no order status): a Limit fills once LTP <= price; a Stop-limit triggers at LTP >= trigger,
+        then fills once LTP <= the limit (like the exchange)."""
+        et = st.get("etype", bk.MARKET)
+        if et == bk.SL and not st.get("triggered"):
+            if ltp < st["etrig"]:
+                return
+            st["triggered"] = True
+        if et in (bk.LIMIT, bk.SL) and ltp <= st["eprice"]:
+            self._filled(st, min(st["eprice"], ltp), st["units"], now_text, events, key)
+            st["entry_st"] = bk.COMPLETE
+
     def _closed(self, st, price, reason, now_text, events, key):
         st.update(exit=round(float(price), 2) if price is not None else None, exit_time=now_text,
                   exit_reason=reason, closed=reason, alert="")
         self._ev(events, key, "exit", price=st["exit"], reason=reason, time=now_text)
 
     def _step(self, key, st, ltp, book, now_text, eod, events):
-        # 1 -- entry
-        if st.get("fill") is None:
+        # 1 -- entry (a Limit / Stop-limit may fill in parts: keep watching it until it is complete)
+        if entry_open(st):
             s, lost = self._look(book, st.get("entry_id"))
             if s:
                 st["entry_st"] = s.status
-                if s.status == bk.COMPLETE and s.filled_qty:
-                    self._filled(st, s.avg_price, s.filled_qty, now_text, events, key)
-                elif s.status in (bk.REJECTED, bk.CANCELLED):
+                if s.status != bk.TRIGGER_PENDING and s.status not in (bk.SENT, bk.UNKNOWN):
+                    st["triggered"] = True
+                if s.filled_qty and s.filled_qty != st.get("fill_qty"):
+                    self._fill_update(st, s.avg_price, s.filled_qty, now_text, events, key)
+                if s.status in (bk.REJECTED, bk.CANCELLED) and st.get("fill") is None:
                     st["closed"] = f"entry {s.status.lower()}"
-                    self._ev(events, key, "failed", text=f"entry {s.status.lower()}: {s.message}")
+                    kind = "cancelled" if s.status == bk.CANCELLED else "failed"
+                    self._ev(events, key, kind, text=f"entry {s.status.lower()}"
+                             + (f" ({st['cancel_req']})" if st.get("cancel_req") else f": {s.message}"))
                     return
             elif lost:
-                self._filled(st, st.get("ref") or ltp, st["units"], now_text, events, key)
-                self._ev(events, key, "log", text="dry run: entry assumed filled after a restart")
-            if st.get("fill") is None:
-                if (eod or st.get("exit_req")) and st.get("entry_id") and st.get("entry_st") not in bk.FINAL:
-                    res = self.broker.cancel(st["entry_id"])
-                    self._ev(events, key, "log", text=f"entry not filled - cancel {'sent' if res.ok else 'FAILED: ' + res.message}")
+                if st.get("etype", bk.MARKET) == bk.MARKET or st.get("fill") is not None:
+                    if st.get("fill") is None:
+                        self._filled(st, st.get("ref") or ltp, st["units"], now_text, events, key)
+                        self._ev(events, key, "log", text="dry run: entry assumed filled after a restart")
+                    st["entry_st"] = bk.COMPLETE
+                else:                                     # dry run after a restart: wait again at the same prices
+                    res = self.broker.place(self._entry_req(st))
                     if res.ok:
+                        st["entry_id"] = res.order_id
+                        self._ev(events, key, "log", text=f"dry run: entry order placed again after a restart ({res.order_id})")
+            elif self.assumed and st.get("fill") is None and ltp is not None:
+                self._assume_entry(st, float(ltp), now_text, events, key)
+        # cancel the unfilled entry / the unfilled rest: Cancel, 15:15, or an exit before / during the fill
+        if entry_open(st) and (st.get("cancel_req") or eod or st.get("exit_req")):
+            if self.clock() - (st.get("cancel_sent") or 0) >= MODIFY_EVERY:
+                st["cancel_sent"] = self.clock()
+                why = st.get("cancel_req") or ("15:15" if eod else st.get("exit_req"))
+                res = self.broker.cancel(st["entry_id"])
+                self._ev(events, key, "log", text=f"entry {'rest ' if st.get('fill') is not None else ''}cancel "
+                         f"({why}): {'sent' if res.ok else 'FAILED: ' + res.message}")
+                if res.ok and (self.assumed or self.paper):
+                    st["entry_st"] = bk.CANCELLED
+                    if st.get("fill") is None:
                         st["closed"] = "entry cancelled"
-                        self._ev(events, key, "failed", text="entry cancelled before a fill")
-                return
+                        self._ev(events, key, "cancelled", text=f"entry cancelled ({why})")
+                        return
+        if st.get("fill") is None:
+            return
+        if st.get("cancel_req") and not entry_open(st):
+            st["cancel_req"] = ""                         # the rest is gone; the filled part stays protected
 
         fill = st["fill"]
         if ltp is not None:
@@ -282,6 +365,15 @@ class PositionManager:
         lvl = trail_level(plan.get("trail"), fill, st.get("high"))
         if lvl is not None and (want is None or lvl > want):
             want = lvl
+        if st.get("sl_id") and st.get("sl_qty") and st["sl_qty"] != st["fill_qty"]:
+            res = self.broker.modify(st["sl_id"], order_type=st.get("sl_kind"), trigger_price=st["sl_trg"],
+                                     price=bk.round_tick(st["sl_trg"] - self.gap) if st.get("sl_kind") == bk.SL else None,
+                                     quantity=st["fill_qty"])
+            if res.ok:
+                self._ev(events, key, "log", text=f"exchange SL quantity {st['sl_qty']} -> {st['fill_qty']} (more filled)")
+                st["sl_qty"] = st["fill_qty"]
+            else:
+                self._ev(events, key, "log", text=f"SL quantity modify FAILED: {res.message}")
         if st.get("sl_trg") is not None and not st.get("sl_reset") and want is not None:
             want = max(want, st["sl_trg"])                    # never down (except a user change)
         if want is None:
@@ -315,7 +407,8 @@ class PositionManager:
                               price=limit, trigger_price=trigger, tag=st["tag"], ref_price=None)
         res = self.broker.place(req)
         if res.ok:
-            st.update(sl_id=res.order_id, sl_st=bk.SENT, sl_trg=trigger, sl_reset=False, alert="")
+            st.update(sl_id=res.order_id, sl_st=bk.SENT, sl_trg=trigger, sl_reset=False, alert="",
+                      sl_qty=int(st["fill_qty"] or st["units"]))
             if st.get("sl_first") is None:
                 st["sl_first"] = trigger
             self._ev(events, key, "sl", text=f"exchange SL placed: {kind} trigger {trigger:.2f}"
@@ -330,6 +423,8 @@ class PositionManager:
     def _send_exit(self, key, st, fill, now_text, events):
         if st.get("exit_id"):
             return
+        if entry_open(st):
+            return                                        # cancel the unfilled rest first (sent above)
         if st["exit_tries"] >= EXIT_TRIES:
             if st.get("alert") != "EXIT FAILED":
                 st["alert"] = "EXIT FAILED"
@@ -337,7 +432,8 @@ class PositionManager:
                          "- close it in the Upstox app")
             return
         if st.get("sl_id") and st.get("sl_st") not in bk.FINAL:
-            res = self.broker.modify(st["sl_id"], order_type=bk.MARKET)
+            res = self.broker.modify(st["sl_id"], order_type=bk.MARKET,
+                                     quantity=st["fill_qty"] if st.get("sl_qty") != st["fill_qty"] else None)
             if res.ok:
                 st.update(exit_id=st["sl_id"], exit_how="modify")
                 self._ev(events, key, "log", text=f"exit ({st['exit_req']}): exchange SL changed to MARKET")
