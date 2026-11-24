@@ -9,10 +9,15 @@ All trading logic runs once in the background engine (engine.py); pages only rea
 matching version number changes.
 """
 import json
+import time
 from datetime import datetime, timedelta
 
+from fastapi import Request
+from fastapi.responses import RedirectResponse
 from nicegui import app, ui
+from starlette.middleware.base import BaseHTTPMiddleware
 
+import auth
 import bep
 import brokers
 import config
@@ -154,6 +159,60 @@ def card_title(text, icon=None):
         ui.label(text).classes("text-md font-bold")
 
 
+# ====================================================================== login (PR 5)
+def logged_in() -> bool:
+    """True when no password is set, or this browser logged in (with the current password) within 30 days."""
+    if not auth.enabled():
+        return True
+    u = app.storage.user
+    return u.get("auth_until", 0) > time.time() and u.get("auth_epoch") == auth.epoch()
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Every page except /login needs the login once a password is set (auth.py). NiceGUI's own files and its
+    websocket (/_nicegui...) stay open, as in NiceGUI's authentication example."""
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if not path.startswith("/_nicegui") and path != "/login" and not logged_in():
+            return RedirectResponse("/login")
+        return await call_next(request)
+
+
+app.add_middleware(AuthMiddleware)
+
+
+@ui.page("/login")
+def login_page():
+    if logged_in():
+        ui.navigate.to("/")
+        return
+    ui.dark_mode(True)
+    client_ip = ui.context.client.request.client.host if ui.context.client.request.client else ""
+
+    def try_login():
+        ok, msg = auth.check(pw.value, client_ip)
+        if ok:
+            app.storage.user.update(auth_until=time.time() + auth.REMEMBER_DAYS * 86400, auth_epoch=auth.epoch())
+            engine.log(f"Login from {client_ip or 'a browser'}.")
+            ui.navigate.to("/")
+        else:
+            engine.log(f"Login failed from {client_ip or 'a browser'}: {msg}")
+            err.set_text(msg)
+            pw.set_value("")
+    with ui.card().classes("absolute-center w-80 gap-3"):
+        ui.label(config.APP_NAME).classes("text-xl font-bold")
+        pw = ui.input("Password", password=True, password_toggle_button=True).classes("w-full") \
+            .on("keydown.enter", try_login)
+        err = ui.label("").classes("text-sm text-red-5")
+        ui.button("Log in", icon="login", on_click=try_login).classes("w-full")
+        ui.label(f"This browser stays logged in for {auth.REMEMBER_DAYS} days.").classes("text-xs opacity-60")
+
+
+def logout():
+    app.storage.user.pop("auth_until", None)
+    ui.navigate.to("/login")
+
+
 # ====================================================================== shell: header + navigation
 @ui.page("/")
 @ui.page("/{_:path}")
@@ -191,6 +250,8 @@ def root():
         alerts_badge = ui.badge("ALERTS PAUSED").props("rounded color=red")
         alert_btn = ui.button("", on_click=engine.toggle_alerts).props("dense no-caps")
         algo_btn = ui.button("", on_click=engine.toggle_algo_pause).props("dense no-caps")
+        if auth.enabled():
+            ui.button(icon="logout", on_click=logout).props("flat round color=white dense").tooltip("Log out")
         ui.button(icon="dark_mode", on_click=lambda: dark.toggle()).props("flat round color=white dense") \
             .tooltip("Light / dark")
 
@@ -2753,4 +2814,6 @@ engine.scan_timer = app.timer(config.SCAN_INTERVAL_SECONDS, engine.scan)
 app.timer(config.OPENING_TICK_SECONDS, engine.opening)
 app.timer(config.OPTION_LTP_SECONDS, engine.option_tick)
 
-ui.run(title=config.APP_NAME, port=config.APP_PORT, reload=False, dark=True)
+ui.run(title=config.APP_NAME, host=config.APP_HOST, port=config.APP_PORT, reload=False, dark=True,
+       storage_secret=auth.storage_secret(),
+       session_middleware_kwargs={"max_age": auth.REMEMBER_DAYS * 86400, "same_site": "lax"})

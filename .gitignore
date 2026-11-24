@@ -5,3 +5,8 @@ orders_*.csv
 common_watch_*.json
 upstox_token.json
 sandbox_token.json
+auth.json
+auth.json.tmp
+.storage_secret
+.nicegui/
+.venv/

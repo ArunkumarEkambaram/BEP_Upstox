@@ -6,6 +6,10 @@ config.py — central configuration for the BEP Support monitor.
 # keeps its own settings.json, upstox_token.json, orders_*.csv and common_watch_*.json in its own folder.
 APP_NAME = "BEP Upstox"
 APP_PORT = 8084
+# PR 5: the cloud server runs the app behind Tailscale with BEP_HOST=127.0.0.1 (deploy/bep-upstox.service); on the
+# PC the default stays NiceGUI's 0.0.0.0 (reachable from this PC and the home network).
+import os as _os
+APP_HOST = _os.environ.get("BEP_HOST", "0.0.0.0")
 
 # Nifty index instrument key (spot LTP)
 NIFTY_INDEX_KEY = "NSE_INDEX|Nifty 50"

@@ -1,7 +1,7 @@
 # CLAUDE.md: BEP Upstox project context (read at the start of every session)
 
 Repo: `ArunkumarEkambaram/BEP_Upstox` (default branch `master`; updated together with each feature PR).
-Run: `python app.py` → http://localhost:**8084** (`config.APP_PORT`). Needs `nicegui>=3.1.0`, Python 3.14 on the user's PC.
+Run: `python app.py` → http://localhost:**8084** (`config.APP_PORT`). Needs `nicegui>=3.1.0`, Python 3.14 on the user's PC. Cloud server: `deploy/README.md` (PR 5).
 **What it is:** a copy of `ArunkumarEkambaram/BEP-AlgoDelta` (`main` at its PR #49, full history kept) that will send orders **directly to Upstox** (with a registered static IP, later on a cloud server) instead of through AlgoDelta. The BEP logic (Support board, ⭐, Pair cross, Replay, Order Management triggers, exit rules, Order Details) stays the same; the order path is replaced.
 Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until this one is proven live; port 8083; important BEP-logic fixes are ported to **both** apps until one is retired), `ArunkumarEkambaram/LTP_Crossing` (reference only, do not change).
 **Since PR 3 there is no AlgoDelta code in this app:** every order goes through the broker layer (`brokers/`, `positions.py`) in the mode chosen on Setup › Broker orders: Dry run (default at every start) / Sandbox / Live. The BEP-AlgoDelta app is the safety backup.
@@ -12,7 +12,7 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
 - During market hours, **don't push**. Keep work on a local branch until the user says so.
 - **Never change the default branch directly** (no commits, pushes or merges to it on Claude's own initiative), especially near or during market hours. Every change, docs-only ones included, goes to a **new branch**. It's merged later, only when the user says "merge PR #n". The user's running app stays on the default branch it pulled. (Asked on 20 Nov 2026, just before the open. The user can allow an exception in chat, as for PR #23.)
 - After merging, the user runs `git pull` and restarts the app.
-- `__pycache__/`, `settings.json`, `upstox_token.json`, `sandbox_token.json`, `orders_*.csv` and `common_watch_*.json` are git-ignored. Never commit them.
+- `__pycache__/`, `settings.json`, `upstox_token.json`, `sandbox_token.json`, `auth.json`, `.storage_secret`, `.nicegui/`, `.venv/`, `orders_*.csv` and `common_watch_*.json` are git-ignored. Never commit them.
 - The cloud session can't delete GitHub branches (proxy 403). The user deletes merged branches, or turns on "Automatically delete head branches".
 - This repo's default branch is `master` (created by the user on GitHub). PRs target `master`.
 - **New features and fixes go into BOTH projects** (BEP_Upstox and BEP-AlgoDelta) until one is retired (user, 24 Nov): one PR per repo, and remind the user to merge both.
@@ -22,7 +22,8 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
 - **PR 2 (broker layer + Upstox adapter):** see "BEP Upstox decisions" below (decisions 3–4).
 - **PR 3 (engine on the broker layer, AlgoDelta removed):** decision 6 below.
 - **PR 4 (Limit / Stop-limit on the broker layer):** decision 7 below.
-- **Next PR:** (5) login + cloud deploy script.
+- **PR 5 (password login + cloud server scripts):** decision 8 below.
+- **Next:** set up the server together with the user (outside market hours), Dry run / Sandbox on trading days, then 1-lot live tests once the static IP is registered.
 
 - The plan as agreed in BEP-AlgoDelta on 23 Nov 2026 (copied unchanged; "this app" there means BEP-AlgoDelta):
   - **PLANNED: a separate "BEP Upstox" app (Upstox direct + cloud), agreed 23 Nov 2026; start on 24 Nov (market holiday).** This app (AlgoDelta) stays unchanged and in use until BEP Upstox is proven live. **Target: switch before the AlgoDelta subscription ends (joined 15 Nov 2026, paid to about 14 Dec).**
@@ -102,6 +103,14 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
    - **Dry run:** the paper broker fills on the 2 s LTP (Limit at min(price, LTP); Stop-limit triggers at LTP ≥ trigger, then fills at LTP ≤ limit); placed outside market hours it gets no stale LTP (waits for 09:15). After a restart a lost unfilled entry is placed again at the same prices. **Sandbox:** the same rules are assumed on the LTP (no order status there).
    - **Not done (by choice):** modifying the price / trigger of an unfilled order (cancel and place again; a Modify button after the switch). `limit_orders.py` / the `mg` column stay only to read old orders files; remove after the switch.
    - Checked (24 Nov): 47 unit tests (9 new: limit / stop-limit fills, cancel, 15:15, exit before fill, partial fills growing the SL, partial + exit, sandbox, restart); the real engine in Dry run: Manual Stop-limit 140 → 141 waits (STOP chip), triggers and fills at 140.5 → SL 128.5 → square-off; a Limit card deleted → cancelled; Stop-limit refused with LTP above the trigger; all pages load without errors.
+
+8. **PR 5: password login and the cloud server (user, 24 Nov: all suggested).**
+   - **Server:** AWS Lightsail Mumbai, Ubuntu 24.04, 1 GB plan, its static IP (registered in the Upstox app after market hours; that logs the token out).
+   - **Access: Tailscale** (private network, HTTPS `https://<host>.<tailnet>.ts.net` via `tailscale serve --bg 8084`); the app listens on 127.0.0.1 there (`BEP_HOST`, `config.APP_HOST`; on the PC the default stays 0.0.0.0). Firewall (ufw): SSH + `tailscale0` only; port 8084 never open.
+   - **Login (`auth.py`):** one password, salted scrypt hash in `auth.json` (git-ignored; set with `.venv/bin/python auth.py set-password`, off with `remove-password`, min 8 characters). No `auth.json` = no login (the PC). `AuthMiddleware` in `app.py` sends every page except `/login` (and NiceGUI's `/_nicegui…`) to `/login`; the browser stays logged in 30 days (`app.storage.user` `auth_until` + `auth_epoch`: a new password logs every browser out; session cookie `max_age` 30 days, secret in `.storage_secret`). Logout icon in the header. 5 wrong tries from one address → blocked 5 min (behind Tailscale serve all browsers share 127.0.0.1, so the block is effectively global). Logins / failures go to the Log.
+   - **Service:** `bep-upstox` (systemd: starts at boot, `Restart=always`, 5 s, `TZ=Asia/Kolkata`, `BEP_HOST=127.0.0.1`); server clock IST; runs all day, every day. Logs: `journalctl -u bep-upstox -f`.
+   - **Scripts:** `deploy/setup_server.sh` (one time, from the cloned repo: apt, IST, uv + Python 3.14, `.venv`, packages, the service, ufw, Tailscale) and `deploy/update.sh` (`git pull --ff-only origin master`, packages, restart, status; refused Mon–Fri 09:00–15:35 IST unless `--force`). The repo is cloned with a read-only GitHub **deploy key**. Guide: `deploy/README.md`.
+   - Checked (24 Nov): 53 unit tests (6 new in `tests/test_auth.py`); a real run with a password: `/order-details` → `/login`, wrong password "4 tries left", login → `/`, `/setup` reachable, Logout → `/login`; 5 wrong → blocked, another address unaffected; without `auth.json` `/` and `/setup` answer 200. Scripts pass `bash -n`; **not yet run on a real server.**
 
 ## Inherited from BEP-AlgoDelta (up to its PR #49)
 Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-AlgoDelta** PRs. **Since PR 3 here, every mention of AlgoDelta JSON, `order_bridge.py`, webhooks, `squareoff_position` / `cancel_order` or "AlgoDelta holds the SL / Target / trail" is replaced by decision 6 above** (the BEP logic, triggers, warnings and screens still apply). The Limit / Stop-limit parts come back in PR 4.
@@ -378,7 +387,7 @@ Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-
 ## Daily checklist (user, BEP Upstox)
 1. Before 09:08: start the app. On Setup, enter today's Upstox token and upload the BEP CSV; the order defaults are already saved.
 2. Choose the order mode on Setup › Broker orders: Dry run (default), Sandbox (sandbox token saved) or Live (static IP registered in the Upstox app). The header shows DRY RUN / SANDBOX / LIVE.
-3. Keep the app running (PC, later the cloud server): the SL is at the exchange, but trailing, the target, candle SLs and 15:15 need the app.
+3. Keep the app running (PC, or the cloud server, which runs it all day): the SL is at the exchange, but trailing, the target, candle SLs and 15:15 need the app. On the server, open it through Tailscale and log in.
 4. Add Order Management rows before 09:15 if you want first-candle triggers.
 
 ## Open / not yet verified
