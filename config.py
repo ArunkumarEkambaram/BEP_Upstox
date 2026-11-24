@@ -51,6 +51,17 @@ TRACK_GIVE_UP_SECONDS = 180
 # Upstox
 UPSTOX_ACCESS_TOKEN = ""   # paste a pre-generated access token
 
+# Broker orders (BEP Upstox PR 2, brokers/). Mode "dry" (nothing sent) / "sandbox" (api-sandbox.upstox.com, the
+# 30-day sandbox token) / "live" (needs the static IP registered in the user's Upstox app). The mode is NOT saved:
+# the app always starts in "dry". Until PR 3 only the Setup "Test order" panel uses it; the engine's orders still
+# go through the inherited AlgoDelta code (order_bridge.py).
+BROKER_MODE = "dry"
+BROKER = {
+    "broker": "upstox",          # the only adapter for now (brokers.BROKERS)
+    "market_protection": -1,     # market / SL-M orders: -1 = automatic, 1-25 = percent (saved)
+    "algo_name": "",             # X-Algo-Name header, empty until Upstox gives one (saved)
+}
+
 # Market hours (IST).
 MARKET_OPEN = "09:15"
 MARKET_CLOSE = "15:40"

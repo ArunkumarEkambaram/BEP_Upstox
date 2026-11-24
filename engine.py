@@ -15,6 +15,7 @@ from datetime import datetime
 from nicegui import run
 
 import bep
+import brokers
 import config
 import exit_rules
 import limit_orders
@@ -26,6 +27,7 @@ import settings_store
 import trade_tracker
 import upstox_client
 from bep_monitor import BepMonitor
+from brokers import base as bk
 from common_watch import CommonWatch  # noqa: F401  (also used for pair titles)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -68,7 +70,7 @@ class Engine:
         self.events = []                                     # (seq, {"msg", "type", "title"})
         self.event_seq = 0
         self.versions = {k: 0 for k in ("board", "cards", "watch", "orders", "plan", "log", "settings", "bep",
-                                                 "cross", "replay")}
+                                                 "cross", "replay", "broker")}
         self.bep_upload_text = {n: "" for n in config.INDEXES}
         self.scan_timer = None
         self._scan_busy = False
@@ -76,6 +78,10 @@ class Engine:
         self._trades_at = 0.0
         self._book_at = 0.0                                  # last Upstox order-book read (limit orders)
         self._limit_busy = False
+        config.BROKER_MODE = "dry"                           # broker orders: always start in Dry run (PR 2)
+        self.sandbox_token, self.sandbox_saved = settings_store.load_sandbox_token()
+        self.broker = self._make_broker()
+        self.test_orders = []                                # Setup "Test order" panel (newest first)
         self.order_log = self._load_orders_today()
         self._restore_side_locks()
         self.log(f"App started. {self.settings_status} Dry run is ON.")
@@ -312,6 +318,169 @@ class Engine:
         self.log(f"{name} AlgoDelta settings saved. {saved}")
         self.bump("settings")
         return saved
+
+    # ------------------------------------------------------------------ broker orders (PR 2)
+    def _make_broker(self):
+        """The broker for the current Setup mode (brokers.create is the one place that picks the adapter)."""
+        return brokers.create(config.BROKER_MODE, broker=config.BROKER["broker"],
+                              live_token_fn=lambda: self.client.access_token,
+                              sandbox_token_fn=lambda: self.sandbox_token,
+                              algo_name=config.BROKER["algo_name"],
+                              market_protection=int(config.BROKER["market_protection"]))
+
+    def set_broker_mode(self, mode: str):
+        if mode not in brokers.MODES:
+            return
+        config.BROKER_MODE = mode
+        self.broker = self._make_broker()
+        self.log(f"Broker orders: {brokers.MODE_LABELS[mode]} ({self.broker.name}"
+                 + (", sandbox" if mode == "sandbox" else "") + "). Engine orders still use AlgoDelta until PR 3.")
+        self.bump("broker", "settings")
+
+    def save_broker_settings(self, market_protection: int, algo_name: str) -> str:
+        config.BROKER.update(market_protection=int(market_protection), algo_name=(algo_name or "").strip())
+        self.broker = self._make_broker()
+        saved = settings_store.save()
+        self.log(f"Broker settings: market protection {config.BROKER['market_protection']}, algo name "
+                 f"{config.BROKER['algo_name'] or '(none)'}. {saved}")
+        self.bump("broker")
+        return saved
+
+    def save_sandbox_token(self, token: str) -> str:
+        token = (token or "").strip()
+        if not token:
+            return "Sandbox token is empty."
+        self.sandbox_token, self.sandbox_saved = token, _now().strftime("%Y-%m-%d")
+        ok = settings_store.save_sandbox_token(token, self.sandbox_saved)
+        self.log("Upstox sandbox token saved." if ok else "Could not save the sandbox token file (kept in memory).")
+        self.bump("broker")
+        return "Sandbox token saved (valid 30 days from when Upstox generated it)."
+
+    def forget_sandbox_token(self):
+        settings_store.forget_sandbox_token()
+        self.sandbox_token = self.sandbox_saved = None
+        self.log("Upstox sandbox token deleted from this computer.")
+        self.bump("broker")
+
+    def sandbox_token_text(self) -> str:
+        if not self.sandbox_token:
+            return "No sandbox token saved."
+        try:
+            age = (_now().date() - datetime.strptime(self.sandbox_saved, "%Y-%m-%d").date()).days
+            left = 30 - age
+            return f"Sandbox token saved on {self.sandbox_saved}" + (
+                f" (about {left} day(s) left)" if left > 0 else " - probably EXPIRED: generate a new one")
+        except (TypeError, ValueError):
+            return "Sandbox token saved."
+
+    async def option_key(self, name, strike, opt):
+        """(instrument_key, error) of a current-expiry option."""
+        mon = self.monitors[name]
+        if not self.connected:
+            return None, "connect Upstox first (Setup > Upstox): the option key and LTP come from it"
+        if not mon.expiry:
+            return None, "no expiry known yet - wait for the first scan after connecting"
+        mapping, err = await run.io_bound(market_utils.option_instrument_keys, self.client, mon.expiry,
+                                          config.INDEXES[name]["underlying_key"])
+        ik = (mapping or {}).get(int(strike), {}).get(opt)
+        return (ik, None) if ik else (None, err or f"{strike}{opt} not found for expiry {mon.expiry}")
+
+    def _test_row(self, order_id):
+        return next((t for t in self.test_orders if t["id"] == order_id), None)
+
+    def _test_log(self, text, ok=True):
+        self.log(f"[Broker test · {brokers.MODE_LABELS[config.BROKER_MODE]}] {text}")
+        self.bump("broker")
+        return ok, text
+
+    async def test_place(self, name, strike, opt, lots, side, order_type, price=None, trigger=None):
+        """Setup "Test order": places one order through the current broker. Returns (ok, text)."""
+        ik, err = await self.option_key(name, strike, opt)
+        if not ik:
+            return self._test_log(f"not sent: {err}", False)
+        ltp = await self.quote_option(name, strike, opt)
+        qty = int(lots) * int(config.INDEXES[name]["lot_size"])
+        req = bk.OrderRequest(ik, side, qty, order_type, price=float(price or 0), trigger_price=float(trigger or 0),
+                              tag=f"BEP-TEST-{_now().strftime('%H%M%S')}", symbol=f"{name} {int(strike)} {opt}",
+                              ref_price=ltp)
+        res = await run.io_bound(self.broker.place, req)
+        mode = config.BROKER_MODE
+        if not res.ok:
+            return self._test_log(f"{bk.describe(req)}: FAILED - {res.message}"
+                                  + (f" ({res.code})" if res.code else ""), False)
+        for oid in res.order_ids:
+            self.test_orders.insert(0, {"id": oid, "time": _stamp(), "mode": mode, "name": name,
+                                        "strike": int(strike), "opt": opt, "key": ik, "side": side, "qty": qty,
+                                        "type": order_type, "price": req.price, "trigger": req.trigger_price,
+                                        "tag": req.tag, "status": bk.SENT, "filled": 0, "avg": 0.0,
+                                        "msg": res.message})
+        del self.test_orders[50:]
+        for oid in res.order_ids:
+            await self.test_status(oid, quiet=True)
+        return self._test_log(f"{bk.describe(req)}: placed, order id {', '.join(res.order_ids)} (LTP {ltp})")
+
+    async def test_status(self, order_id, quiet=False):
+        t = self._test_row(order_id)
+        if not t:
+            return False, "unknown test order"
+        if t["mode"] != config.BROKER_MODE:
+            return False, f"this order was placed in {brokers.MODE_LABELS[t['mode']]} mode"
+        if config.BROKER_MODE == "dry":                 # move the paper order on with a fresh LTP
+            ltp = await self.quote_option(t["name"], t["strike"], t["opt"])
+            self.broker.on_ltp(t["key"], ltp)
+        st = await run.io_bound(self.broker.status, order_id)
+        if st.status != bk.UNKNOWN:
+            t.update(status=st.status, filled=st.filled_qty, avg=st.avg_price, msg=st.message or t["msg"],
+                     type=st.order_type or t["type"], price=st.price or t["price"],
+                     trigger=st.trigger_price or t["trigger"])
+        else:
+            t["msg"] = st.message
+        self.bump("broker")
+        text = f"{order_id}: {st.status}" + (f" {st.filled_qty} @ {st.avg_price:.2f}" if st.filled_qty else "") + (
+            f" - {st.message}" if st.message else "")
+        return (True, text) if quiet else self._test_log(text, st.status != bk.UNKNOWN)
+
+    async def test_modify(self, order_id, order_type, price=None, trigger=None):
+        t = self._test_row(order_id)
+        if not t or t["mode"] != config.BROKER_MODE:
+            return False, "this order belongs to another mode"
+        res = await run.io_bound(lambda: self.broker.modify(
+            order_id, order_type=order_type, price=None if price in (None, "") else float(price),
+            trigger_price=None if trigger in (None, "") else float(trigger)))
+        if res.ok:
+            t.update(type=order_type, msg=res.message)
+            if price not in (None, ""):
+                t["price"] = float(price)
+            if trigger not in (None, ""):
+                t["trigger"] = float(trigger)
+            await self.test_status(order_id, quiet=True)
+        return self._test_log(f"modify {order_id} -> {order_type}"
+                              + (f" price {float(price):.2f}" if price not in (None, "") else "")
+                              + (f" trigger {float(trigger):.2f}" if trigger not in (None, "") else "")
+                              + (": done" if res.ok else f": FAILED - {res.message}"), res.ok)
+
+    async def test_cancel(self, order_id):
+        t = self._test_row(order_id)
+        if not t or t["mode"] != config.BROKER_MODE:
+            return False, "this order belongs to another mode"
+        res = await run.io_bound(self.broker.cancel, order_id)
+        if res.ok:
+            t["msg"] = res.message
+            if config.BROKER_MODE == "sandbox":         # no status call in the sandbox
+                t["status"] = bk.CANCELLED
+            await self.test_status(order_id, quiet=True)
+        return self._test_log(f"cancel {order_id}: " + ("done" if res.ok else f"FAILED - {res.message}"), res.ok)
+
+    async def test_exit(self, order_id):
+        t = self._test_row(order_id)
+        if not t or t["mode"] != config.BROKER_MODE:
+            return False, "this order belongs to another mode"
+        if config.BROKER_MODE == "dry":
+            ltp = await self.quote_option(t["name"], t["strike"], t["opt"])
+            self.broker.on_ltp(t["key"], ltp)
+        res = await run.io_bound(self.broker.exit_by_tag, t["tag"])
+        return self._test_log(f"exit tag {t['tag']}: " + (f"done, order id {', '.join(res.order_ids)}" if res.ok
+                                                          else f"FAILED - {res.message}"), res.ok)
 
     # ------------------------------------------------------------------ common price watch
     @staticmethod
