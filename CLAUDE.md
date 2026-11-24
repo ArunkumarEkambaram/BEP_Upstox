@@ -128,7 +128,7 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
 - **09:15 second-side window (BEP-AlgoDelta decision 32, user 24 Nov: "a testing feature, add it later" here; not built in this app).** Once one side (CE or PE) has its 09:15 order, the other side may follow only within `open_second_side_secs` (60 s) of that order's time (CE at 09:15:20 → PE allowed until 09:16:20); after that the other side is **restricted** for the day.
   - Only orders that lock a side start the window (here: an entry placed / dry run / failed); a BLOCKED order frees the side and doesn't.
   - Both qualifying within 60 s → both placed. Log "PE 09:15 order restricted: CE was ordered at 09:15:20, more than 60 s ago"; Dashboard status "PE: restricted (CE at 09:15:20)".
-  - Setup "09:15 second side within (seconds, 0 = off)" in Order defaults, saved in settings.json.
+  - Setup (Order defaults): a **"09:15 second side window" switch** (ON by default, `open_second_side`) + "Second side within (seconds)" (60, > 0, greyed out when OFF, `open_second_side_secs`), saved in settings.json. OFF = each side any time 09:15–09:20.
   - A restart restores the first order's time from the orders file. A restricted side doesn't skip the 09:15 ⭐ row.
   - In BEP-AlgoDelta: `BepMonitor._restrict_second_side` (start of `opening_tick`), lock status `restricted`; `engine._add_star_rows` ignores restricted locks. Port the same when the user confirms the test result.
 
