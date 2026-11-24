@@ -109,6 +109,9 @@ def _default_auto_order() -> dict:
         "open_entry_above": 2, "open_sl_below": 2, "open_sl_tf": 5,
         # PR #47: a hard max SL at the exchange (POINT, from the fill) on top of the app CANDLE SL; 0 = none
         "open_max_sl": 17,
+        # The 09:15 order's own trailing SL (independent of the Default order trail): once the high reaches
+        # entry + trigger, the exchange SL moves to high - gap in steps of point, never down
+        "open_trail": True, "open_trail_trigger": 20, "open_trail_point": 1, "open_trail_gap": 19,
         # BEP Upstox PR 3: a card whose SL is CANDLE only also gets an exchange SL this many points below the
         # fill (a fall inside a candle, or the app down); 0 = none
         "candle_max_sl": 17,

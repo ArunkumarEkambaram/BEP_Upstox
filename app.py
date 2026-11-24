@@ -1191,6 +1191,32 @@ def card_rule_box(name, r, kind, locked):
                 ui.label(f"Default {d_val:g} {d_type} (Setup)").classes("text-xs opacity-60")
 
 
+def guarded_trail_set(r, tr):
+    """Order Details, 09:15 order: "Check the stoploss" first when the new trail would put the SL at or above the
+    LTP (the position would exit at once)."""
+    rid = r["id"]
+    st = engine._bk(r)
+    ltp = engine.option_ltp.get(engine._opt_key(r))
+    fill = (st or {}).get("fill")
+    if tr and tr.get("on") and st and fill is not None and ltp is not None:
+        high = max([h for h in (st.get("high"), ltp) if h is not None])
+        lvl = positions.trail_level({"trigger": tr["trigger"], "gap": tr["gap"], "step": tr.get("point") or 1},
+                                    fill, high)
+        lvl = max([x for x in (lvl, st.get("sl_trg")) if x is not None], default=None)
+        if lvl is not None and lvl >= ltp:
+            with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 420px"):
+                ui.label("Check the stoploss").classes("text-lg font-bold text-orange-6")
+                ui.label(f"With this trail the SL is {lvl:g}, at or above the LTP {ltp:g}: the order would exit "
+                         "at once.").classes("text-sm")
+                with ui.row():
+                    ui.button("Cancel", on_click=dlg.close).props("flat")
+                    ui.button("Set anyway", on_click=lambda: (dlg.close(), engine.set_order_trail(rid, tr))) \
+                        .props("color=orange-8")
+            dlg.open()
+            return True
+    return engine.set_order_trail(rid, tr)
+
+
 def trail_dialog(name, r, cur=None, on_save=None, note=None):
     """Trailing SL popup: ON/OFF, Type, Trigger, Point, Gap. Default: the card's own (before ordering). With
     on_save: a placed order's app-watched trailing SL (cur = its values)."""
@@ -2350,6 +2376,16 @@ def orders_page():
                 dlg.close()
                 cur = {"on": True, "type": "LTP", "trigger": t["trigger"], "point": t["step"], "gap": t["gap"]} if t \
                     else {**engine.setup_trail(r["index"]), "on": True}
+                if not lim and engine.is_opening(r):        # 09:15 order: its own Setup trail; warn first
+                    if not t:
+                        cfg9 = config.AUTO_ORDER.get(r["index"], {})
+                        cur = {"on": True, "type": "LTP", "trigger": float(cfg9.get("open_trail_trigger", 20)),
+                               "point": float(cfg9.get("open_trail_point", 1)),
+                               "gap": float(cfg9.get("open_trail_gap", 19))}
+                    trail_dialog(r["index"], {}, cur=cur, on_save=lambda tr: guarded_trail_set(r, tr),
+                                 note="09:15 order: this replaces its trailing SL. The high seen so far is kept and "
+                                      "the exchange SL never moves down.")
+                    return
                 trail_dialog(r["index"], {}, cur=cur, on_save=lambda tr: engine.set_order_trail(rid, tr),
                              note="This replaces the order's trailing SL (it moves the exchange SL order).")
             with ui.row().classes("items-center gap-2"):
@@ -2770,6 +2806,16 @@ def order_defaults_card(name):
                                         value=ad_cfg.get("open_max_sl", 17), min=0, step=1).classes("w-full") \
                     .tooltip("An SL-M order at the exchange from the fill (e.g. entry 152 - 17 = 135), on top of the "
                              "candle SL: exits on a fast fall or if the app is down.")
+                ad_open_trail = ui.switch("09:15 trailing SL", value=bool(ad_cfg.get("open_trail", True))) \
+                    .tooltip("The 09:15 order's own trail (not the Default order trail): once the high reaches entry "
+                             "+ Trigger, the exchange SL moves to high - Gap in steps of Point, never down. It can be "
+                             "changed on the placed order in Order Details.")
+                with ui.row().classes("w-full gap-2 no-wrap"):
+                    ad_open_t_trig = ui.number("Trigger", value=ad_cfg.get("open_trail_trigger", 20), min=0, step=1).classes("flex-1")
+                    ad_open_t_point = ui.number("Point", value=ad_cfg.get("open_trail_point", 1), min=0, step=1).classes("flex-1")
+                    ad_open_t_gap = ui.number("Gap", value=ad_cfg.get("open_trail_gap", 19), min=0, step=1).classes("flex-1")
+                for w in (ad_open_t_trig, ad_open_t_point, ad_open_t_gap):
+                    w.bind_enabled_from(ad_open_trail, "value")
 
         with ui.row().classes("items-center gap-2"):
             ui.button("Save", icon="save", on_click=lambda: save())
@@ -2802,6 +2848,13 @@ def order_defaults_card(name):
         open_max, candle_max = num(ad_open_max.value), num(ad_candle_max.value)
         if open_max is None or open_max < 0 or candle_max is None or candle_max < 0:
             return None, "The max SL values must be numbers of 0 or more (0 = none)."
+        open_trail = bool(ad_open_trail.value)
+        o_trig, o_point, o_gap = num(ad_open_t_trig.value), num(ad_open_t_point.value), num(ad_open_t_gap.value)
+        if open_trail:
+            if None in (o_trig, o_point, o_gap) or o_trig <= 0 or o_point <= 0 or o_gap <= 0:
+                return None, "09:15 trailing SL: Trigger, Point and Gap must be numbers above 0."
+            if o_gap > o_trig:
+                return None, "09:15 trailing SL: Gap must not be larger than Trigger."
         trail = bool(ad_trail.value)
         t_trig, t_point, t_gap = num(ad_trail_trigger.value), num(ad_trail_point.value), num(ad_trail_gap.value)
         if trail:
@@ -2813,7 +2866,10 @@ def order_defaults_card(name):
                 "trail": trail, "max_above_bep": max_above, **defaults,
                 "open_entry_above": open_entry, "open_sl_below": open_sl, "open_sl_tf": int(ad_open_tf.value or 5),
                 "open_max_sl": open_max, "candle_max_sl": candle_max, "warn_above_bep": warn_bep,
-                "max_loss_day": max_loss,
+                "max_loss_day": max_loss, "open_trail": open_trail,
+                "open_trail_trigger": o_trig if o_trig is not None else ad_cfg.get("open_trail_trigger", 20),
+                "open_trail_point": o_point if o_point is not None else ad_cfg.get("open_trail_point", 1),
+                "open_trail_gap": o_gap if o_gap is not None else ad_cfg.get("open_trail_gap", 19),
                 "trail_trigger": t_trig if t_trig is not None else ad_cfg.get("trail_trigger", 20),
                 "trail_point": t_point if t_point is not None else ad_cfg.get("trail_point", 1),
                 "trail_gap": t_gap if t_gap is not None else ad_cfg.get("trail_gap", 20)}, ""
@@ -2835,7 +2891,9 @@ def order_defaults_card(name):
                            + 
                            f"09:15 order at LTP >= BEP + {nums['open_entry_above']:g} and < BEP + {nums['max_above_bep']}, "
                            f"SL = {nums['open_sl_tf']}-min close below BEP - {nums['open_sl_below']:g} (app)"
-                           + (f", max SL {nums['open_max_sl']:g} pts (exchange)." if nums['open_max_sl'] else "."))
+                           + (f", max SL {nums['open_max_sl']:g} pts (exchange)" if nums['open_max_sl'] else "")
+                           + (f", trail {nums['open_trail_trigger']:g}/{nums['open_trail_gap']:g} "
+                              f"(point {nums['open_trail_point']:g})." if nums['open_trail'] else ", trail OFF."))
 
 
 # ====================================================================== Logs

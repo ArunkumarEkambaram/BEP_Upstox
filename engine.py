@@ -1956,6 +1956,10 @@ class Engine:
                 and trade_tracker._f(r.get("exit")) is None and not r.get("c_done") and not Engine.squared_off(r))
 
     @staticmethod
+    def is_opening(r) -> bool:
+        return r.get("kind", "Opening candle") == "Opening candle" and not r.get("mg")
+
+    @staticmethod
     def order_rule(o, kind):
         """The SL / Target rule an order is watched with now (dict or None): its app rule (c_sl / c_tgt); for a
         limit / stop-limit order also the LTP / POINT rule kept in mg."""
