@@ -4,3 +4,4 @@ settings.json.tmp
 orders_*.csv
 common_watch_*.json
 upstox_token.json
+sandbox_token.json

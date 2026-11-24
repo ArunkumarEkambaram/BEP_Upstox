@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from nicegui import app, ui
 
 import bep
+import brokers
 import config
 import exit_rules
 import export_utils
@@ -2380,8 +2381,215 @@ def setup_page():
                       on_change=lambda ev: engine.set_daily_limit(int(ev.value or 1))).classes("w-full")
             ui.label("Pause alerts / Pause algo are in the header.").classes("text-xs opacity-70")
 
+    broker_card()
     for name in config.INDEXES:
         algodelta_card(name)
+
+
+_STATUS_COLOR = {"COMPLETE": "green", "CANCELLED": "grey-7", "REJECTED": "red", "OPEN": "blue",
+                 "TRIGGER_PENDING": "orange-8", "SENT": "blue-grey", "UNKNOWN": "grey-6"}
+
+
+def broker_card():
+    """Setup > Broker orders (PR 2): mode, Upstox order settings, sandbox token and the Test order panel.
+    Until PR 3 the engine's own orders still go through AlgoDelta; this card only drives the Test order panel."""
+    name = engine.active()[0] if engine.active() else next(iter(config.INDEXES))
+    with ui.card().classes("w-full"):
+        card_title("Broker orders (Upstox direct)", "account_balance")
+        ui.label("New order path, being built. Until PR 3 the app's own orders (09:15, Order Management) still go "
+                 "through AlgoDelta; this card only drives the Test order panel below.") \
+            .classes("text-xs text-orange-5")
+        with ui.row().classes("w-full gap-6 items-start"):
+            # ---- mode + settings
+            with ui.column().classes("flex-1 min-w-[300px] gap-2"):
+                ui.select({"upstox": "Upstox"}, value=config.BROKER["broker"], label="Broker") \
+                    .props("disable").classes("w-full").tooltip("Only Upstox for now (brokers/ adapters)")
+                mode = ui.toggle(dict(brokers.MODE_LABELS), value=config.BROKER_MODE)
+                mode_note = ui.label("").classes("text-xs opacity-70")
+
+                def show_mode():
+                    mode_note.set_text({
+                        "dry": "Dry run: nothing is sent; a paper broker fills orders on the live LTP.",
+                        "sandbox": "Sandbox: sent to api-sandbox.upstox.com with the sandbox token (no real money; "
+                                   "no order status there).",
+                        "live": "LIVE: real orders on your Upstox account. Needs the static IP registered in your "
+                                "Upstox app (else error UDAPI1154)."}[config.BROKER_MODE])
+
+                def on_mode(ev):
+                    if ev.value == config.BROKER_MODE:
+                        return
+                    if ev.value != "live":
+                        engine.set_broker_mode(ev.value)
+                        show_mode()
+                        return
+                    with ui.dialog() as dlg, ui.card():
+                        ui.label("Switch broker orders to LIVE? Test orders will be real orders with real money.")
+                        with ui.row():
+                            ui.button("Cancel", on_click=dlg.close)
+                            ui.button("Yes, live", on_click=lambda: (engine.set_broker_mode("live"), dlg.close())) \
+                                .props("color=red")
+                    dlg.on("hide", lambda: (mode.set_value(config.BROKER_MODE), show_mode()))
+                    dlg.open()
+                mode.on_value_change(on_mode)
+                show_mode()
+                mp = ui.number("Market protection % (market / SL-M orders; -1 = automatic)",
+                               value=config.BROKER["market_protection"], min=-1, max=25, step=1, precision=0) \
+                    .classes("w-full")
+                algo = ui.input("Algo name (X-Algo-Name header; leave empty until Upstox gives one)",
+                                value=config.BROKER["algo_name"]).classes("w-full")
+
+                def save_settings():
+                    v = int(mp.value if mp.value is not None else -1)
+                    if v == 0 or v < -1 or v > 25:
+                        ui.notify("Market protection must be -1 (automatic) or 1 to 25. 0 is rejected by Upstox "
+                                  "for market orders.", type="negative")
+                        return
+                    ui.notify(engine.save_broker_settings(v, algo.value), type="positive")
+                ui.button("Save broker settings", icon="save", on_click=save_settings).classes("w-full")
+
+                ui.separator()
+                sb_token = ui.input("Upstox sandbox token (30 days)", password=True,
+                                    password_toggle_button=True).classes("w-full")
+                sb_text = ui.label(engine.sandbox_token_text()).classes("text-xs opacity-70")
+
+                def save_sb():
+                    ui.notify(engine.save_sandbox_token(sb_token.value))
+                    sb_token.set_value("")
+                with ui.row().classes("w-full gap-2"):
+                    ui.button("Save sandbox token", icon="key", on_click=save_sb)
+                    ui.button("Forget", icon="delete", on_click=engine.forget_sandbox_token) \
+                        .props("flat dense no-caps color=grey-6")
+                ui.label("Create it at Upstox developer > Manage Apps > New Sandbox App > Generate.") \
+                    .classes("text-xs opacity-70")
+
+            # ---- test order form
+            with ui.column().classes("flex-1 min-w-[320px] gap-2"):
+                ui.label("Test order").classes("font-bold")
+                ui.label("Place, modify, cancel and check one order through the current mode. Use 1 lot. "
+                         "Needs the Upstox connection (option key and LTP).").classes("text-xs opacity-70")
+                with ui.row().classes("w-full gap-2 no-wrap"):
+                    strike = ui.number("Strike", step=config.INDEXES[name]["strike_interval"], precision=0) \
+                        .classes("flex-1")
+                    opt = ui.toggle(["CE", "PE"], value="CE")
+                    lots = ui.number("Lots", value=1, min=1, step=1, precision=0).classes("w-20")
+                with ui.row().classes("w-full gap-2 items-center no-wrap"):
+                    side = ui.toggle(["BUY", "SELL"], value="BUY")
+                    otype = ui.select(["LIMIT", "SL", "SL-M", "MARKET"], value="LIMIT", label="Type").classes("w-28")
+                    ltp_lbl = ui.label("LTP -").classes("text-sm opacity-80")
+
+                    async def get_ltp():
+                        if not strike.value:
+                            return
+                        v = await engine.quote_option(name, int(strike.value), opt.value)
+                        ltp_lbl.set_text(f"LTP {v:.2f}" if v is not None else "LTP -")
+                    ui.button(icon="refresh", on_click=get_ltp).props("flat round dense").tooltip("Fetch the LTP")
+                with ui.row().classes("w-full gap-2 no-wrap"):
+                    price = ui.number("Limit price", step=0.05, format="%.2f").classes("flex-1")
+                    trigger = ui.number("Trigger price", step=0.05, format="%.2f").classes("flex-1")
+
+                def show_fields():
+                    price.set_visibility(otype.value in ("LIMIT", "SL"))
+                    trigger.set_visibility(otype.value in ("SL", "SL-M"))
+                otype.on_value_change(lambda _e: show_fields())
+                show_fields()
+
+                async def do_place():
+                    if not strike.value or not lots.value:
+                        ui.notify("Enter the strike and lots.", type="warning")
+                        return
+                    if int(lots.value) > 1:
+                        ui.notify("Test orders: 1 lot is enough.", type="warning")
+
+                    async def go():
+                        ok, text = await engine.test_place(name, int(strike.value), opt.value, int(lots.value),
+                                                           side.value, otype.value, price.value, trigger.value)
+                        ui.notify(text, type="positive" if ok else "negative")
+                    if config.BROKER_MODE != "live":
+                        await go()
+                        return
+                    with ui.dialog() as dlg, ui.card():
+                        ui.label(f"Place a REAL {side.value} {otype.value} order for {int(lots.value)} lot(s) of "
+                                 f"{int(strike.value)}{opt.value}?").classes("font-bold")
+                        with ui.row():
+                            ui.button("Cancel", on_click=dlg.close)
+
+                            async def yes():
+                                dlg.close()
+                                await go()
+                            ui.button("Place live order", on_click=yes).props("color=red")
+                    dlg.open()
+                ui.button("Place test order", icon="send", on_click=do_place).classes("w-full")
+
+        # ---- test orders list
+        ui.label("Test orders (this session)").classes("font-bold mt-2")
+        box = ui.column().classes("w-full gap-1")
+
+        def modify_dialog(t):
+            with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 380px"):
+                ui.label(f"Modify {t['id']} ({t['strike']}{t['opt']} {t['side']})").classes("font-bold")
+                mt = ui.select(["LIMIT", "SL", "SL-M", "MARKET"], value=t["type"], label="Type").classes("w-full")
+                mp_ = ui.number("Limit price", value=t["price"] or None, step=0.05, format="%.2f").classes("w-full")
+                mtr = ui.number("Trigger price", value=t["trigger"] or None, step=0.05, format="%.2f") \
+                    .classes("w-full")
+
+                def vis():
+                    mp_.set_visibility(mt.value in ("LIMIT", "SL"))
+                    mtr.set_visibility(mt.value in ("SL", "SL-M"))
+                mt.on_value_change(lambda _e: vis())
+                vis()
+
+                async def save():
+                    dlg.close()
+                    ok, text = await engine.test_modify(
+                        t["id"], mt.value, mp_.value if mt.value in ("LIMIT", "SL") else None,
+                        mtr.value if mt.value in ("SL", "SL-M") else None)
+                    ui.notify(text, type="positive" if ok else "negative")
+                with ui.row():
+                    ui.button("Cancel", on_click=dlg.close)
+                    ui.button("Modify", on_click=save).props("color=primary")
+            dlg.open()
+
+        async def act(fn, *args):
+            ok, text = await fn(*args)
+            ui.notify(text, type="positive" if ok else "negative")
+
+        def render():
+            box.clear()
+            with box:
+                if not engine.test_orders:
+                    ui.label("None yet.").classes("text-sm opacity-60")
+                for t in engine.test_orders:
+                    same_mode = t["mode"] == config.BROKER_MODE
+                    final = t["status"] in ("COMPLETE", "CANCELLED", "REJECTED")
+                    with ui.row().classes("w-full items-center gap-2 text-sm no-wrap"):
+                        ui.label(t["time"]).classes("opacity-60 w-16")
+                        ui.badge(brokers.MODE_LABELS[t["mode"]]).props("outline color=grey-6")
+                        ui.label(f"{t['side']} {t['qty']} {t['strike']}{t['opt']}").classes("w-36")
+                        px = {"MARKET": "market", "LIMIT": f"limit {t['price']:.2f}",
+                              "SL-M": f"SL-M trg {t['trigger']:.2f}",
+                              "SL": f"SL trg {t['trigger']:.2f} lmt {t['price']:.2f}"}.get(t["type"], t["type"])
+                        ui.label(px).classes("w-44")
+                        ui.badge(t["status"].replace("_", " ")).props(f"color={_STATUS_COLOR.get(t['status'], 'grey')}")
+                        if t["filled"]:
+                            ui.label(f"{t['filled']} @ {t['avg']:.2f}")
+                        ui.label(t["id"]).classes("opacity-60 text-xs")
+                        ui.label(t["msg"] or "").classes("opacity-70 text-xs ellipsis flex-1")
+                        if same_mode:
+                            ui.button(icon="refresh", on_click=lambda t=t: act(engine.test_status, t["id"])) \
+                                .props("flat round dense").tooltip("Status")
+                            if not final:
+                                ui.button(icon="edit", on_click=lambda t=t: modify_dialog(t)) \
+                                    .props("flat round dense").tooltip("Modify")
+                                ui.button(icon="close", on_click=lambda t=t: act(engine.test_cancel, t["id"])) \
+                                    .props("flat round dense color=red").tooltip("Cancel")
+                            if t["status"] == "COMPLETE" and config.BROKER_MODE != "sandbox":
+                                ui.button(icon="logout", on_click=lambda t=t: act(engine.test_exit, t["id"])) \
+                                    .props("flat round dense color=orange").tooltip("Exit the position of this tag")
+            sb_text.set_text(engine.sandbox_token_text())
+            if mode.value != config.BROKER_MODE:
+                mode.set_value(config.BROKER_MODE)
+                show_mode()
+        when_changed(["broker"], render)
 
 
 def algodelta_card(name):
