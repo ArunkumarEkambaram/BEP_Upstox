@@ -114,6 +114,13 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
 
 9. **NIFTY change % in the header (user, 24 Nov; also BEP-AlgoDelta; all suggested).** The header chip shows `NIFTY 26,050.35  +448.10 (+1.75%)`, green up / red down. `Engine.fetch_index_ltps` uses the Upstox **full market quote** (`GET /v2/market-quote/quotes`, `upstox_client.fetch_quote`: `last_price` + `net_change`) instead of the LTP call: the same one call per scan. % = net change ÷ (LTP − net change) × 100 (`Engine.index_change`, `ltp_change`). Before 09:15 and on holidays it is the last session's change (Upstox's own figure; on 24 Nov it should read +1.75 %). If the full quote fails: the plain LTP call, no change for that scan, one Log line. Header only (not the Dashboard).
 
+10. **Max loss per day (user, 24 Nov; also BEP-AlgoDelta; all suggested).** Setup › Order defaults **"Max loss per day (₹, 0 = off; Dry run only for now)"** (`max_loss_day`, default 2000, saved in settings.json). **For now only in Dry run** (Sandbox / Live later, after testing): day loss = today's closed + open P&L of the **DRY RUN** orders (`Engine.max_loss_state`); the limit is hit at a loss ≥ the value.
+   - **⚡ / Add & place** (first of the ⚡ checks): popup "Max loss per day reached: Day loss ₹2,350 is past your max loss ₹2,000", **Place anyway** / Cancel. Place anyway marks the card (`loss_ok`, `Engine.ack_max_loss`, logged), so a PENDING entry armed then still fires.
+   - **Orders nobody clicks** (a PENDING card firing later): not placed, card BLOCKED (⚡ can be pressed again), toast + Log "Max loss per day reached (loss ₹x, limit ₹y); NOT sent". Checked in `Engine.place_entry` (`sig["loss_ok"]` skips it).
+   - **The 09:15 order is not affected** (user: "This loss limit is not applicable for 9:15 order"). Open positions are left alone (no auto square-off). Test orders on Setup are not affected.
+   - Header: a red **MAX LOSS ₹2,350 / 2,000** badge once hit.
+   - Checked: 58 unit tests (`tests/test_max_loss.py`: dry-run rows only, open P&L counts, 0 = off, not in Sandbox / Live, blocked / 09:15 exempt / Place anyway); Setup shows the field.
+
 ## Inherited from BEP-AlgoDelta (up to its PR #49)
 Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-AlgoDelta** PRs. **Since PR 3 here, every mention of AlgoDelta JSON, `order_bridge.py`, webhooks, `squareoff_position` / `cancel_order` or "AlgoDelta holds the SL / Target / trail" is replaced by decision 6 above** (the BEP logic, triggers, warnings and screens still apply). The Limit / Stop-limit parts come back in PR 4.
 ## Architecture (after PR #3)

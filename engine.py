@@ -262,6 +262,32 @@ class Engine:
                 "open": len(opens), "open_pnl": round(sum(x[1] for x in opens), 2),
                 "pnl": round(sum(pnl), 2), "wins": sum(1 for p in pts if p > 0)}
 
+    def max_loss_state(self, name=None) -> dict:
+        """Max loss per day (Setup, default ₹2,000; 0 = off). For now only in Dry run and only DRY RUN orders count:
+        today's closed P&L + open P&L. `hit` = the loss reached the limit (new orders ask first / are not placed;
+        the 09:15 order is exempt)."""
+        name = name or next(iter(config.AUTO_ORDER))
+        limit = float(config.AUTO_ORDER.get(name, {}).get("max_loss_day", 2000) or 0)
+        rows = [r for r in self.order_log if r.get("status") == "DRY RUN"]
+        closed = sum(r["pnl"] for r in rows if isinstance(r.get("pnl"), (int, float)))
+        opn = sum(x[1] for x in (self.open_pnl(r) for r in rows) if x)
+        pnl = round(closed + opn, 2)
+        active = bool(config.AUTO_ORDER_DRY_RUN) and limit > 0
+        loss = round(max(0.0, -pnl), 2)
+        return {"limit": limit, "pnl": pnl, "loss": loss, "active": active, "hit": active and loss >= limit}
+
+    def max_loss_text(self, name=None) -> str:
+        m = self.max_loss_state(name)
+        return f"Day loss ₹{m['loss']:,.0f} is past your max loss ₹{m['limit']:,.0f} (Dry run orders, closed + open)."
+
+    def ack_max_loss(self, name, row_id):
+        """⚡ -> 'Place anyway' in the max-loss popup: this card may place (also a PENDING entry armed now)."""
+        r = self.watches[name].get(row_id)
+        if r is not None:
+            r["loss_ok"] = _stamp()
+            self.log(f"{name} {r.get('strike')}{r.get('opt')}: 'Place anyway' past the max loss per day "
+                     f"({self.max_loss_text(name)})")
+
     # ------------------------------------------------------------------ actions from the pages
     async def connect(self, token: str):
         token = (token or "").strip()
@@ -856,7 +882,8 @@ class Engine:
                     note = f"Entry at price {p['price']:.2f} {arrow} hit, LTP {ltp:.2f} (armed {p['armed_at']})"
                     res = await self.place_watch_order(name, r["id"], fill_ltp=ltp, entry_note=note)
                     if res:
-                        self.notify(f"{name} {r['strike']}{r['opt']}: {note} - order {ORDER_STATUS.get(res['status'], res['status'].upper())}",
+                        self.notify(f"{name} {r['strike']}{r['opt']}: {note} - order {ORDER_STATUS.get(res['status'], res['status'].upper())}"
+                                    + (f" ({res.get('detail')})" if res["status"] == "blocked" else ""),
                                     {"sent": "positive", "dry_run": "info"}.get(res["status"], "negative"),
                                     f"{name} entry {r['strike']}{r['opt']}")
 
@@ -929,7 +956,8 @@ class Engine:
                "ltp": ltp,
                "entry_note": entry_note,
                "expiry": mon.expiry, "order_type": "strategy_order", "kind": kind,
-               "kind_label": label, "time": _stamp(), "params": params, "app_rules": app_rules, "entry": entry}
+               "kind_label": label, "time": _stamp(), "params": params, "app_rules": app_rules, "entry": entry,
+               "loss_ok": bool(r.pop("loss_ok", None))}
         r["pending"] = None
         cw.set_order_status(row_id, "sending")
         self.bump("watch")
@@ -1300,6 +1328,12 @@ class Engine:
         if config.AUTO_ORDER_PAUSED:
             return {"status": "blocked", "message": f"Algo trading is PAUSED; NOT sent: {head}", "payload": payload,
                     "detail": "Algo trading paused"}
+        if sig.get("kind") != "opening" and not sig.get("loss_ok"):          # max loss per day (09:15 exempt)
+            ml = self.max_loss_state(name)
+            if ml["hit"]:
+                why = (f"Max loss per day reached (loss ₹{ml['loss']:,.0f}, limit ₹{ml['limit']:,.0f})")
+                return {"status": "blocked", "message": f"{why}; NOT sent: {head}", "payload": payload,
+                        "detail": why}
         if mode != "dry" and self._live_count_today() >= config.AUTO_ORDER_DAILY_LIMIT:
             why = f"Daily limit ({config.AUTO_ORDER_DAILY_LIMIT}) reached"
             return {"status": "blocked", "message": f"{why}; NOT sent: {head}", "payload": payload, "detail": why}
