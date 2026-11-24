@@ -240,7 +240,9 @@ def root():
     with ui.header().classes("items-center gap-3 px-4 py-2 bg-[#0f172a] text-white border-b border-slate-800"):
         ui.button(icon="menu", on_click=lambda: drawer.toggle()).props("flat round color=white dense")
         ui.label(config.APP_NAME).classes("text-lg font-bold tracking-wide")
-        ltp_lbl = ui.label("").classes("text-sm bg-slate-800 rounded px-2 py-1")
+        with ui.row().classes("items-center gap-2 no-wrap bg-slate-800 rounded px-2 py-1"):
+            ltp_lbl = ui.label("").classes("text-sm")
+            chg_lbl = ui.label("").classes("text-sm font-medium")
         status_lbl = ui.label("").classes("text-sm opacity-80")
         ui.space()
         conn_badge = ui.badge("").props("rounded")
@@ -256,8 +258,14 @@ def root():
             .tooltip("Light / dark")
 
     def refresh_header():
-        parts = [f"{n} {engine.ltp[n]}" if engine.ltp[n] is not None else f"{n} --" for n in engine.active()]
+        names = engine.active()
+        parts = [f"{n} {engine.ltp[n]:,.2f}" if engine.ltp[n] is not None else f"{n} --" for n in names]
         ltp_lbl.set_text(" · ".join(parts) or "--")
+        ch = engine.index_change(names[0]) if names else None       # NIFTY change vs the previous close
+        chg_lbl.set_text(f"{ch[0]:+,.2f} ({ch[1]:+.2f}%)" if ch else "")
+        chg_lbl.classes(remove="text-green-5 text-red-5")
+        if ch:
+            chg_lbl.classes(add="text-green-5" if ch[0] >= 0 else "text-red-5")
         status_lbl.set_text(engine.status)
         conn_badge.set_text("UPSTOX ✓ " + engine.user_name if engine.connected else "UPSTOX ✗")
         conn_badge.props("color=" + ("green-8" if engine.connected else "grey-7"))
