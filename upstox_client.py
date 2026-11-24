@@ -46,6 +46,28 @@ class UpstoxClient:
         except Exception as e:
             return None, str(e)
 
+    # ---------------------------------------------------------- full quote (LTP + net change)
+    def fetch_quote(self, instrument_keys: list):
+        """Full market quote (GET /v2/market-quote/quotes): {instrument_key: {"ltp", "net_change"}}, None
+        or (None, error). net_change = LTP - the previous session's close (Upstox's own figure; before 09:15 and
+        on holidays it is the last session's change)."""
+        if not instrument_keys:
+            return {}, None
+        url = f"{BASE_V2}/market-quote/quotes"
+        try:
+            resp = requests.get(url, headers=self.headers,
+                                params={"instrument_key": ",".join(instrument_keys)}, timeout=10)
+            if resp.status_code != 200:
+                return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            result = {}
+            for v in (resp.json().get("data") or {}).values():
+                ik = v.get("instrument_token") or v.get("instrument_key")
+                if ik is not None and v.get("last_price") is not None:
+                    result[ik] = {"ltp": v["last_price"], "net_change": v.get("net_change")}
+            return result, None
+        except Exception as e:
+            return None, str(e)
+
     # ---------------------------------------------------------- expiries
     def fetch_option_expiries(self, underlying_key: str):
         """Returns (list_of_expiry_date_strings_ascending, None) or (None, error)."""

@@ -66,6 +66,7 @@ class Engine:
         self.connection_text = "Not connected"
         self.status = "Waiting for a valid Upstox token (Setup page)"
         self.ltp = {n: None for n in config.INDEXES}
+        self.ltp_change = {n: None for n in config.INDEXES}     # index points vs the previous close (header %)
         self.option_ltp = {}                                 # (index, strike, opt) -> live LTP for Order Management cards
         self._opt_ltp_busy = False
         self.log_lines = []
@@ -110,7 +111,23 @@ class Engine:
         return [n for n in config.INDEXES if config.INDEXES[n]["enabled"]]
 
     def fetch_index_ltps(self, names):
+        """Index LTPs ({name: ltp}, error). One full-quote call, which also gives the net change for the header
+        (LTP vs the previous close); if it fails, the plain LTP call and no change for this scan."""
         keys = {config.INDEXES[n]["index_key"]: n for n in names}
+        quotes, q_err = self.client.fetch_quote(list(keys))
+        if quotes:
+            got = {keys[k]: v for k, v in quotes.items() if k in keys}
+            if not got and len(names) == 1 and len(quotes) == 1:
+                got[names[0]] = next(iter(quotes.values()))
+            if got:
+                for n, q in got.items():
+                    self.ltp_change[n] = q.get("net_change")
+                return {n: q["ltp"] for n, q in got.items()}, None
+        for n in names:
+            self.ltp_change[n] = None
+        if q_err and q_err != getattr(self, "_quote_err", None):
+            self._quote_err = q_err
+            self.log(f"NIFTY change %: full quote unavailable ({q_err}); showing the LTP only.")
         ltp_map, err = self.client.fetch_ltp(list(keys))
         if not ltp_map:
             return {}, err
@@ -118,6 +135,16 @@ class Engine:
         if not out and len(names) == 1 and len(ltp_map) == 1:
             out[names[0]] = next(iter(ltp_map.values()))
         return out, err
+
+    def index_change(self, name):
+        """(points, percent) vs the previous close, or None."""
+        ltp, chg = self.ltp.get(name), self.ltp_change.get(name)
+        try:
+            ltp, chg = float(ltp), float(chg)
+        except (TypeError, ValueError):
+            return None
+        prev = ltp - chg
+        return (round(chg, 2), round(chg / prev * 100, 2)) if prev else None
 
     # ------------------------------------------------------------------ orders file
     @staticmethod
