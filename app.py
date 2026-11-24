@@ -159,6 +159,14 @@ def card_title(text, icon=None):
         ui.label(text).classes("text-md font-bold")
 
 
+def setup_section(title, icon=None, classes="flex-1 min-w-[320px]"):
+    """A bordered Setup section with a title row; use as `with setup_section(...):`."""
+    card = ui.card().props("flat bordered").classes(f"{classes} gap-2")
+    with card:
+        card_title(title, icon)
+    return card
+
+
 # ====================================================================== login (PR 5)
 def logged_in() -> bool:
     """True when no password is set, or this browser logged in (with the current password) within 30 days."""
@@ -2407,8 +2415,7 @@ def setup_page():
 
     with ui.row().classes("w-full gap-4 items-stretch"):
         # ---- Upstox
-        with ui.card().classes("flex-1 min-w-[320px]"):
-            card_title("Upstox", "key")
+        with setup_section("Upstox", "key", "flex-1 min-w-[250px]"):
             token = ui.input("Upstox access token", password=True, password_toggle_button=True).classes("w-full")
             conn = ui.label(engine.connection_text).classes("text-sm")
 
@@ -2426,8 +2433,7 @@ def setup_page():
             ui.timer(1.0, lambda: conn.set_text(engine.connection_text))
 
         # ---- BEP files
-        with ui.card().classes("flex-1 min-w-[320px]"):
-            card_title("BEP files", "upload_file")
+        with setup_section("BEP files", "upload_file", "flex-1 min-w-[250px]"):
             import bep as _bep
             uploaders = {}
             for name in config.INDEXES:
@@ -2451,8 +2457,7 @@ def setup_page():
                     .classes("w-full")
 
         # ---- Scanner
-        with ui.card().classes("flex-1 min-w-[320px]"):
-            card_title("Scanner", "radar")
+        with setup_section("Scanner", "radar", "flex-1 min-w-[250px]"):
             total = 2 * config.STRIKES_EACH_SIDE + 1
             slider = ui.slider(min=1, max=11, step=2, value=total).classes("w-full")
             ui.label().bind_text_from(slider, "value", lambda v: f"{int(v)} strikes (centre ± {(int(v) - 1) // 2})") \
@@ -2475,8 +2480,7 @@ def setup_page():
                 .props("color=orange-8").classes("w-full")
 
         # ---- Trading controls
-        with ui.card().classes("flex-1 min-w-[320px]"):
-            card_title("Trading", "shield")
+        with setup_section("Trading", "shield", "flex-1 min-w-[250px]"):
             ui.label("Dry run / Sandbox / Live: the order mode in Broker orders below (it starts in Dry run).") \
                 .classes("text-sm")
             ui.number("Max orders/day", value=config.AUTO_ORDER_DAILY_LIMIT, min=1, precision=0, step=1,
@@ -2503,71 +2507,71 @@ def broker_card():
                  "target / candle SL / square-off turn it into MARKET).").classes("text-xs opacity-70")
         with ui.row().classes("w-full gap-6 items-start"):
             # ---- mode + settings
-            with ui.column().classes("flex-1 min-w-[300px] gap-2"):
-                ui.select({"upstox": "Upstox"}, value=config.BROKER["broker"], label="Broker") \
-                    .props("disable").classes("w-full").tooltip("Only Upstox for now (brokers/ adapters)")
-                mode = ui.toggle(dict(brokers.MODE_LABELS), value=config.BROKER_MODE)
-                mode_note = ui.label("").classes("text-xs opacity-70")
+            with ui.column().classes("flex-1 min-w-[300px] gap-4"):
+                with setup_section("Order mode", "toggle_on", "w-full"):
+                    ui.select({"upstox": "Upstox"}, value=config.BROKER["broker"], label="Broker") \
+                        .props("disable").classes("w-full").tooltip("Only Upstox for now (brokers/ adapters)")
+                    mode = ui.toggle(dict(brokers.MODE_LABELS), value=config.BROKER_MODE)
+                    mode_note = ui.label("").classes("text-xs opacity-70")
 
-                def show_mode():
-                    mode_note.set_text({
-                        "dry": "Dry run: nothing is sent; a paper broker fills orders on the live LTP.",
-                        "sandbox": "Sandbox: sent to api-sandbox.upstox.com with the sandbox token (no real money). "
-                                   "It has no order status, so fills are assumed at the LTP.",
-                        "live": "LIVE: real orders on your Upstox account. Needs the static IP registered in your "
-                                "Upstox app (else error UDAPI1154)."}[config.BROKER_MODE])
+                    def show_mode():
+                        mode_note.set_text({
+                            "dry": "Dry run: nothing is sent; a paper broker fills orders on the live LTP.",
+                            "sandbox": "Sandbox: sent to api-sandbox.upstox.com with the sandbox token (no real money). "
+                                       "It has no order status, so fills are assumed at the LTP.",
+                            "live": "LIVE: real orders on your Upstox account. Needs the static IP registered in your "
+                                    "Upstox app (else error UDAPI1154)."}[config.BROKER_MODE])
 
-                def on_mode(ev):
-                    if ev.value == config.BROKER_MODE:
-                        return
-                    if ev.value != "live":
-                        engine.set_broker_mode(ev.value)
-                        show_mode()
-                        return
-                    with ui.dialog() as dlg, ui.card():
-                        ui.label("Switch to LIVE? Every order (09:15, Order Management, Test order) will be a real "
-                                 "Upstox order with real money.")
-                        with ui.row():
-                            ui.button("Cancel", on_click=dlg.close)
-                            ui.button("Yes, live", on_click=lambda: (engine.set_broker_mode("live"), dlg.close())) \
-                                .props("color=red")
-                    dlg.on("hide", lambda: (mode.set_value(config.BROKER_MODE), show_mode()))
-                    dlg.open()
-                mode.on_value_change(on_mode)
-                show_mode()
-                mp = ui.number("Market protection % (market / SL-M orders; -1 = automatic)",
-                               value=config.BROKER["market_protection"], min=-1, max=25, step=1, precision=0) \
-                    .classes("w-full")
-                algo = ui.input("Algo name (X-Algo-Name header; leave empty until Upstox gives one)",
-                                value=config.BROKER["algo_name"]).classes("w-full")
+                    def on_mode(ev):
+                        if ev.value == config.BROKER_MODE:
+                            return
+                        if ev.value != "live":
+                            engine.set_broker_mode(ev.value)
+                            show_mode()
+                            return
+                        with ui.dialog() as dlg, ui.card():
+                            ui.label("Switch to LIVE? Every order (09:15, Order Management, Test order) will be a real "
+                                     "Upstox order with real money.")
+                            with ui.row():
+                                ui.button("Cancel", on_click=dlg.close)
+                                ui.button("Yes, live", on_click=lambda: (engine.set_broker_mode("live"), dlg.close())) \
+                                    .props("color=red")
+                        dlg.on("hide", lambda: (mode.set_value(config.BROKER_MODE), show_mode()))
+                        dlg.open()
+                    mode.on_value_change(on_mode)
+                    show_mode()
+                    mp = ui.number("Market protection % (market / SL-M orders; -1 = automatic)",
+                                   value=config.BROKER["market_protection"], min=-1, max=25, step=1, precision=0) \
+                        .classes("w-full")
+                    algo = ui.input("Algo name (X-Algo-Name header; leave empty until Upstox gives one)",
+                                    value=config.BROKER["algo_name"]).classes("w-full")
 
-                def save_settings():
-                    v = int(mp.value if mp.value is not None else -1)
-                    if v == 0 or v < -1 or v > 25:
-                        ui.notify("Market protection must be -1 (automatic) or 1 to 25. 0 is rejected by Upstox "
-                                  "for market orders.", type="negative")
-                        return
-                    ui.notify(engine.save_broker_settings(v, algo.value), type="positive")
-                ui.button("Save broker settings", icon="save", on_click=save_settings).classes("w-full")
+                    def save_settings():
+                        v = int(mp.value if mp.value is not None else -1)
+                        if v == 0 or v < -1 or v > 25:
+                            ui.notify("Market protection must be -1 (automatic) or 1 to 25. 0 is rejected by Upstox "
+                                      "for market orders.", type="negative")
+                            return
+                        ui.notify(engine.save_broker_settings(v, algo.value), type="positive")
+                    ui.button("Save broker settings", icon="save", on_click=save_settings).classes("w-full")
 
-                ui.separator()
-                sb_token = ui.input("Upstox sandbox token (30 days)", password=True,
-                                    password_toggle_button=True).classes("w-full")
-                sb_text = ui.label(engine.sandbox_token_text()).classes("text-xs opacity-70")
+                with setup_section("Sandbox token", "science", "w-full"):
+                    sb_token = ui.input("Upstox sandbox token (30 days)", password=True,
+                                        password_toggle_button=True).classes("w-full")
+                    sb_text = ui.label(engine.sandbox_token_text()).classes("text-xs opacity-70")
 
-                def save_sb():
-                    ui.notify(engine.save_sandbox_token(sb_token.value))
-                    sb_token.set_value("")
-                with ui.row().classes("w-full gap-2"):
-                    ui.button("Save sandbox token", icon="key", on_click=save_sb)
-                    ui.button("Forget", icon="delete", on_click=engine.forget_sandbox_token) \
-                        .props("flat dense no-caps color=grey-6")
-                ui.label("Create it at Upstox developer > Manage Apps > New Sandbox App > Generate.") \
-                    .classes("text-xs opacity-70")
+                    def save_sb():
+                        ui.notify(engine.save_sandbox_token(sb_token.value))
+                        sb_token.set_value("")
+                    with ui.row().classes("w-full gap-2"):
+                        ui.button("Save sandbox token", icon="key", on_click=save_sb)
+                        ui.button("Forget", icon="delete", on_click=engine.forget_sandbox_token) \
+                            .props("flat dense no-caps color=grey-6")
+                    ui.label("Create it at Upstox developer > Manage Apps > New Sandbox App > Generate.") \
+                        .classes("text-xs opacity-70")
 
             # ---- test order form
-            with ui.column().classes("flex-1 min-w-[320px] gap-2"):
-                ui.label("Test order").classes("font-bold")
+            with setup_section("Test order", "send", "flex-1 min-w-[320px]"):
                 ui.label("Place, modify, cancel and check one order through the current mode. Use 1 lot. "
                          "Needs the Upstox connection (option key and LTP).").classes("text-xs opacity-70")
                 with ui.row().classes("w-full gap-2 no-wrap"):
@@ -2701,8 +2705,9 @@ def order_defaults_card(name):
     ad_cfg = config.AUTO_ORDER[name]
     with ui.card().classes("w-full"):
         card_title(f"{name} — Order defaults", "tune")
-        with ui.row().classes("w-full gap-6 items-start"):
-            with ui.column().classes("flex-1 min-w-[320px] gap-2"):
+        with ui.row().classes("w-full gap-4 items-stretch"):
+            # ---- Default order (all orders)
+            with setup_section("Default order (all orders)", "tune"):
                 ad_qty = ui.number("Quantity (lots)", value=ad_cfg["qty"], min=1, precision=0, step=1).classes("w-full")
                 with ui.row().classes("w-full gap-2 no-wrap"):
                     ad_tgt_type = ui.select(["POINT", "LTP"], value=ad_cfg.get("tgt_type", "POINT"), label="Target type").classes("flex-1")
@@ -2710,11 +2715,6 @@ def order_defaults_card(name):
                 with ui.row().classes("w-full gap-2 no-wrap"):
                     ad_sl_type = ui.select(["POINT", "LTP"], value=ad_cfg.get("sl_type", "POINT"), label="Stop loss type").classes("flex-1")
                     ad_sl = ui.number("Stop loss value", value=ad_cfg["sl"], min=0, step=1).classes("flex-1")
-                ad_candle_max = ui.number("Max SL for cards with a CANDLE SL: points below the fill (exchange, 0 = none)",
-                                          value=ad_cfg.get("candle_max_sl", 17), min=0, step=1).classes("w-full") \
-                    .tooltip("A card whose SL is CANDLE only (exit on a candle close) also gets an SL-M order at the "
-                             "exchange this many points below the fill: it covers a fast fall inside a candle and the "
-                             "app being down.")
                 ad_trail = ui.switch("Trailing SL", value=ad_cfg.get("trail", False))
                 with ui.row().classes("w-full gap-2 no-wrap"):
                     ad_trail_trigger = ui.number("Trigger", value=ad_cfg.get("trail_trigger", 20), min=0, step=1).classes("flex-1")
@@ -2724,40 +2724,56 @@ def order_defaults_card(name):
                     w.bind_enabled_from(ad_trail, "value")
                 ui.label("Trailing: once the high reaches entry + Trigger, the exchange SL moves to high - Gap (in "
                          "steps of Point), never down.").classes("text-xs opacity-70")
-            with ui.column().classes("flex-1 min-w-[320px] gap-2"):
-                ui.label("Default target for new Order Management rows (each row can be changed until ordered; "
-                         "type follows Target type; the 09:15 order uses Target value)").classes("text-xs opacity-70")
+                ad_candle_max = ui.number("Max SL for cards with a CANDLE SL: points below the fill (exchange, 0 = none)",
+                                          value=ad_cfg.get("candle_max_sl", 17), min=0, step=1).classes("w-full") \
+                    .tooltip("A card whose SL is CANDLE only (exit on a candle close) also gets an SL-M order at the "
+                             "exchange this many points below the fill: it covers a fast fall inside a candle and the "
+                             "app being down.")
+
+            # ---- Order Management
+            with setup_section("Order Management", "list_alt"):
+                ui.label("Default target for new rows (each row can be changed until ordered; type follows "
+                         "the Default order Target type)").classes("text-xs opacity-70")
                 with ui.row().classes("w-full gap-2 no-wrap"):
                     ad_tgt_same = ui.number("Same strike", value=ad_cfg.get("tgt_same", ad_cfg["tgt"]), min=0, step=1).classes("flex-1")
                     ad_tgt_pair = ui.number("Pair", value=ad_cfg.get("tgt_pair", ad_cfg["tgt"]), min=0, step=1).classes("flex-1")
                     ad_tgt_star = ui.number("BEP Support \u2b50", value=ad_cfg.get("tgt_star", ad_cfg["tgt"]), min=0, step=1).classes("flex-1")
                     ad_tgt_manual = ui.number("Manual entry", value=ad_cfg.get("tgt_manual", ad_cfg["tgt"]), min=0, step=1).classes("flex-1")
-                ad_max_above = ui.number("09:15 order: max points above BEP (skip at or above)",
-                                         value=ad_cfg.get("max_above_bep", 15), min=0, step=1).classes("w-full")
-                with ui.row().classes("w-full gap-2 no-wrap"):
-                    ad_open_entry = ui.number("09:15 entry above BEP +", value=ad_cfg.get("open_entry_above", 2),
-                                              min=0, step=0.5).classes("flex-1") \
-                        .tooltip("The 09:15 order fires at LTP >= BEP + this (0 = just above BEP)")
-                    ad_open_sl = ui.number("09:15 SL: close below BEP -", value=ad_cfg.get("open_sl_below", 2),
-                                           min=0, step=0.5).classes("flex-1") \
-                        .tooltip("CANDLE SL watched by the app: exits when a candle CLOSES below BEP - this")
-                    ad_open_tf = ui.select({1: "1 min", 3: "3 min", 5: "5 min"}, value=int(ad_cfg.get("open_sl_tf", 5)),
-                                           label="SL candle").classes("w-28")
-                ad_open_max = ui.number("09:15 max SL: points below the fill (exchange, 0 = none)",
-                                        value=ad_cfg.get("open_max_sl", 17), min=0, step=1).classes("w-full") \
-                    .tooltip("An SL-M order at the exchange from the fill (e.g. entry 152 - 17 = 135), on top of the "
-                             "candle SL: exits on a fast fall or if the app is down.")
                 ad_warn_bep = ui.number("Warn at \u26a1 when LTP is more than X points above BEP (0 = off)",
                                         value=ad_cfg.get("warn_above_bep", 10), min=0, step=1).classes("w-full") \
                     .tooltip("BEP Support \u2b50, BEP cross Pair and Manual Entry cards: 'Check before placing' "
                              "shows the LTP - BEP difference")
-                ad_max_loss = ui.number("Max loss per day (₹, 0 = off; Dry run only for now)",
+                ad_max_loss = ui.number("Max loss per day ₹ (0 = off)",
                                         value=ad_cfg.get("max_loss_day", 2000), min=0, step=100).classes("w-full") \
                     .tooltip("Today's closed + open P&L of the Dry run orders. Once the loss reaches this: \u26a1 / "
                              "Add & place ask first, a PENDING card that fires is not placed, open positions are "
                              "left alone. The 09:15 order is not affected.")
+                ui.label("Max loss: Dry run only for now; the 09:15 order is not affected.") \
+                    .classes("text-xs opacity-70")
+
+        with ui.row().classes("w-full gap-4 items-stretch"):
+            # ---- 09:15 opening order
+            with setup_section("09:15 opening order", "alarm", "flex-1 min-w-[320px] max-w-[calc(50%-0.5rem)]"):
+                ui.label("Target = the Default order Target value.").classes("text-xs opacity-70")
+                ad_max_above = ui.number("Max points above BEP (skip at or above)",
+                                         value=ad_cfg.get("max_above_bep", 15), min=0, step=1).classes("w-full")
+                with ui.row().classes("w-full gap-2 no-wrap"):
+                    ad_open_entry = ui.number("Entry above BEP +", value=ad_cfg.get("open_entry_above", 2),
+                                              min=0, step=0.5).classes("flex-1") \
+                        .tooltip("The 09:15 order fires at LTP >= BEP + this (0 = just above BEP)")
+                    ad_open_sl = ui.number("SL: close below BEP -", value=ad_cfg.get("open_sl_below", 2),
+                                           min=0, step=0.5).classes("flex-1") \
+                        .tooltip("CANDLE SL watched by the app: exits when a candle CLOSES below BEP - this")
+                    ad_open_tf = ui.select({1: "1 min", 3: "3 min", 5: "5 min"}, value=int(ad_cfg.get("open_sl_tf", 5)),
+                                           label="SL candle").classes("w-28")
+                ad_open_max = ui.number("Max SL: points below the fill (exchange, 0 = none)",
+                                        value=ad_cfg.get("open_max_sl", 17), min=0, step=1).classes("w-full") \
+                    .tooltip("An SL-M order at the exchange from the fill (e.g. entry 152 - 17 = 135), on top of the "
+                             "candle SL: exits on a fast fall or if the app is down.")
+
+        with ui.row().classes("items-center gap-2"):
+            ui.button("Save", icon="save", on_click=lambda: save())
         ad_status = ui.label("").classes("text-sm")
-        ui.button("Save", icon="save", on_click=lambda: save())
 
     def numbers():
         def num(v):

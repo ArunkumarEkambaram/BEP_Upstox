@@ -124,6 +124,12 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
    - Header: a red **MAX LOSS ₹2,350 / 2,000** badge once hit.
    - Checked: 58 unit tests (`tests/test_max_loss.py`: dry-run rows only, open P&L counts, 0 = off, not in Sandbox / Live, blocked / 09:15 exempt / Place anyway); Setup shows the field.
 
+11. **Setup layout in bordered sections (user, 24 Nov; also BEP-AlgoDelta, its decision 33; all suggested).** No setting changed, only where it sits. `setup_section(title, icon, classes)` in `app.py` = a bordered card with a title row.
+   - Top row: **Upstox**, **BEP files**, **Scanner**, **Trading** (min width 250 px, one row on a wide screen).
+   - **Broker orders (Upstox direct):** **Order mode** (broker, Dry run / Sandbox / Live, market protection, algo name, Save broker settings) and **Sandbox token** on the left, **Test order** on the right; the test orders list below.
+   - **NIFTY — Order defaults:** **Default order (all orders)** (quantity, Target, SL, Trailing SL, max SL for CANDLE-SL cards) · **Order Management** (per-type default targets, Warn at ⚡ above BEP, "Max loss per day ₹ (0 = off)" with the note "Dry run only for now; the 09:15 order is not affected") · **09:15 opening order** (max above BEP, entry / SL / candle, max SL). One **Save** at the bottom, as before.
+   - Checked: 58 unit tests; Setup renders, Save works, no page errors.
+
 ## To port later (testing features in BEP-AlgoDelta only)
 - **09:15 second-side window (BEP-AlgoDelta decision 32, user 24 Nov: "a testing feature, add it later" here; not built in this app).** Once one side (CE or PE) has its 09:15 order, the other side may follow only within `open_second_side_secs` (60 s) of that order's time (CE at 09:15:20 → PE allowed until 09:16:20); after that the other side is **restricted** for the day.
   - Only orders that lock a side start the window (here: an entry placed / dry run / failed); a BLOCKED order frees the side and doesn't.
