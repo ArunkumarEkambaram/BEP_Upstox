@@ -844,10 +844,12 @@ def order_type_dialog(name, r):
                           value=r.get("entry_price") if r.get("entry_mode") == "limit" else r.get("price"),
                           min=0, step=0.05).classes("w-full")
         price.bind_visibility_from(mode, "value", lambda v: v == "limit")
-        ui.label("Strategy = market BUY; after the fill the SL waits at the exchange (SL-M), trailing moves it, "
-                 "the target is watched by the app. Limit = buy at the price or cheaper; Stop-limit = wait until "
-                 "the LTP RISES to the trigger. Limit / Stop-limit come in BEP Upstox PR 4 (refused at ⚡ until "
-                 "then).").classes("text-xs opacity-70")
+        ui.label("Strategy = market BUY. Limit = a LIMIT BUY at the price or cheaper (fills at once if the LTP is "
+                 "already below it). Stop-limit = an SL BUY that waits at the exchange until the LTP RISES to the "
+                 "trigger (asked next, above the LTP), then a limit at the limit price. After the fill every type "
+                 "gets the SL at the exchange (SL-M), trailing moves it, the target is watched by the app. An "
+                 "unfilled order is cancelled (by its ID) if the card fails, at 15:15 or when deleted.") \
+            .classes("text-xs opacity-70")
 
         def save():
             limit = mode.value == "limit"
@@ -910,7 +912,7 @@ CHIP = {"WAITING": "grey-7", "TRIGGERED": "green-7", "SENDING": "blue-7", "ORDER
         "EXITED": "purple-6", "FAILED": "red-7", "ORDER FAILED": "red-7", "BLOCKED": "orange-8", "PENDING": "amber-9",
         "SQUARING OFF": "deep-orange-8", "SQUARE-OFF FAILED": "red-7", "LIMIT OPEN": "amber-9", "FILLED": "blue-7",
         "CANCELLING": "deep-orange-8", "CANCEL FAILED": "red-7", "CANCELLED": "grey-7", "REJECTED": "red-7",
-        "NO SL": "red-7", "EXIT FAILED": "red-7", "EXITING": "deep-orange-8"}
+        "NO SL": "red-7", "EXIT FAILED": "red-7", "EXITING": "deep-orange-8", "STOP": "amber-9"}
 
 
 def card_state(r, order=None) -> str:
@@ -930,6 +932,9 @@ def card_state(r, order=None) -> str:
                 return st["alert"]
             if st.get("exit_req"):
                 return f"EXITING · {st['exit_req']}"
+            et = positions.entry_text(st)               # Limit / Stop-limit waiting or partly filled (PR 4)
+            if et and (st.get("fill") is None or not st.get("sl_id")):
+                return et
             if st.get("fill") is None:
                 return f"ORDERED · {os_} · waiting for the fill"
             if st.get("sl_trg") is not None and st.get("sl_id"):
@@ -956,7 +961,7 @@ def card_state(r, order=None) -> str:
     if r["status"] == "exited":
         return "EXITED"
     if r["status"] == "triggered":
-        return {"FAILED": "ORDER FAILED", "BLOCKED": "BLOCKED"}.get(os_, "TRIGGERED")
+        return {"FAILED": "ORDER FAILED", "BLOCKED": "BLOCKED", "CANCELLED": "CANCELLED"}.get(os_, "TRIGGERED")
     return "WAITING"
 
 
@@ -1285,17 +1290,19 @@ def cancel_warning(o):
 
 def confirm_delete(name, r):
     order = engine.row_order(r)
-    open_limit = order is not None and limit_orders.cancellable(limit_orders.parse(order.get("mg")))
+    open_limit = order is not None and engine.entry_cancellable(order)
     with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 440px"):
         ui.label("Delete this row?").classes("text-lg font-bold")
         if open_limit:
-            ui.label("Its limit order is still open at the exchange: deleting sends AlgoDelta cancel_order first.") \
-                .classes("text-sm text-orange-4")
-            cancel_warning(order)
+            ui.label("Its Limit / Stop-limit order is still open at the exchange: deleting cancels it first (by its "
+                     "order ID; other orders on this option are not touched).").classes("text-sm text-orange-4")
+            if order.get("mg"):
+                cancel_warning(order)
         elif r.get("order_status") == "PENDING":
             ui.label("Its pending entry stops (nothing was sent yet).").classes("text-sm opacity-70")
         ui.label("An order already placed stays in Order Details"
-                 + (" and its app SL / Target keep running." if order is not None and order.get("mg") else ".")) \
+                 + (" and its exchange SL / app Target keep running." if order is not None and order.get("bk")
+                    else " and its app SL / Target keep running." if order is not None and order.get("mg") else ".")) \
             .classes("text-sm opacity-70")
 
         async def go():
@@ -1310,6 +1317,8 @@ def confirm_delete(name, r):
 def cancel_limit_dialog(order_id):
     """Confirm AlgoDelta cancel_order for an open limit order (or retry a failed cancel)."""
     o = next((x for x in engine.order_log if x["id"] == order_id), None)
+    if o is not None and engine._bk(o):
+        return cancel_entry_dialog(o)
     m = limit_orders.parse(o.get("mg")) if o else None
     if not limit_orders.cancellable(m):
         return
@@ -1331,6 +1340,30 @@ def cancel_limit_dialog(order_id):
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Close", on_click=dlg.close).props("flat")
             ui.button("Retry cancel" if retry else "Cancel order", icon="cancel", on_click=go).props("color=orange-9")
+    dlg.open()
+
+
+def cancel_entry_dialog(o):
+    """Confirm the cancel of a broker Limit / Stop-limit entry (PR 4): by its order ID, this order only."""
+    st = engine._bk(o)
+    if not engine.entry_cancellable(o):
+        return
+    sym = market_utils.option_symbol(o["index"], o.get("expiry") or engine.monitors[o["index"]].expiry, o["strike"], o["opt"])
+    with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 440px"):
+        ui.label("Cancel order " + sym).classes("text-lg font-bold")
+        ui.label(f"{positions.entry_text(st)} \u00b7 {engine.order_label(o)} \u00b7 {o.get('status')}").classes("text-sm")
+        if st.get("fill") is not None:
+            ui.label(f"{st['fill_qty']} already filled at {st['fill']:.2f}: only the rest is cancelled; the filled part "
+                     "keeps its exchange SL.").classes("text-sm text-amber-5")
+        ui.label("Cancels this order by its order ID within about 2 s. Other orders on this option are not touched.") \
+            .classes("text-xs opacity-70")
+
+        async def go():
+            dlg.close()
+            await engine.cancel_limit(o["id"])
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Close", on_click=dlg.close).props("flat")
+            ui.button("Cancel order", icon="cancel", on_click=go).props("color=orange-9")
     dlg.open()
 
 
@@ -1438,7 +1471,7 @@ def entry_price_box(name, r, pending):
                 return
             engine.set_watch_mode(name, r["id"], e.value if e.value != "strategy" else None)
         tg.on_value_change(mode_changed)
-    if engine.is_stop(r):                             # stop-limit (AlgoDelta sl_order): trigger + limit
+    if engine.is_stop(r):                             # stop-limit (SL BUY at the exchange): trigger + limit
         t0, p0 = engine.stop_prices(r)
         lbl = ui.label(f"{t0:.2f} \u2192 {p0:.2f}" if t0 else "leg \u2192 +%g" % config.STOP_LIMIT_GAP) \
             .classes("text-base font-bold cursor-pointer underline decoration-dotted whitespace-nowrap") \
@@ -1517,11 +1550,11 @@ def order_card(name, r, place, live):
                               on_click=lambda: square_off_dialog(order["id"])) \
                         .props("dense unelevated no-caps color=red-8").tooltip("Exit this position now (market)")
                 m = limit_orders.parse(order.get("mg")) if order is not None else None
-                if limit_orders.cancellable(m):
-                    ui.button("Retry cancel" if m["state"] == "CANCEL FAILED" else "Cancel order", icon="cancel",
-                              on_click=lambda: cancel_limit_dialog(order["id"])) \
+                if order is not None and engine.entry_cancellable(order):
+                    ui.button("Retry cancel" if m and m["state"] == "CANCEL FAILED" else "Cancel order",
+                              icon="cancel", on_click=lambda: cancel_limit_dialog(order["id"])) \
                         .props("dense unelevated no-caps color=orange-9") \
-                        .tooltip("AlgoDelta cancel_order for this open limit order")
+                        .tooltip("Cancel this order's unfilled Limit / Stop-limit entry (by its order ID)")
                 if pending:
                     ui.button("Cancel pending", icon="block",
                               on_click=lambda: engine.cancel_watch_entry(name, r["id"])) \
@@ -1631,6 +1664,9 @@ def order_card(name, r, place, live):
             entry = o.get("entry") if o else None
             if trade_tracker._f(entry) is None and limit_orders.held(mo):
                 entry = mo["fill"]                      # live: order-book fill until the trade book has it
+            bst = engine._bk(o) if o else None
+            if trade_tracker._f(entry) is None and bst and bst.get("fill") is not None:
+                entry = bst["fill"]
             entry_lbl.set_text(_num_text(entry) if o else "--")
         msg_lbl.set_text((f"Stop-limit {mo['trigger']:.2f} \u2192 {mo['price']:.2f}: " if mo and mo.get("trigger") else
                           f"Limit {mo['price']:.2f}: " if mo else "") + (mo.get("msg", "") if mo else ""))
@@ -1791,7 +1827,7 @@ def make_place(name):
 
 def limit_above_ltp(name, r, price, ltp, then):
     """A BUY limit above the LTP fills at once near the LTP. Asks first; the card can switch to Stop-limit
-    (AlgoDelta sl_order: waits at the exchange until the LTP rises to the price)."""
+    (an SL BUY: waits at the exchange until the LTP rises to the price)."""
     with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 460px"):
         ui.label("This limit fills immediately").classes("text-lg font-bold")
         ui.label(f"Limit {price:.2f} is above the LTP {ltp:.2f}: a BUY limit means \"at {price:.2f} or cheaper\", "
@@ -2032,8 +2068,11 @@ def manual_page():
     om_header("Manual Entry", "Pick a strike and place a BUY yourself - no trigger condition. Market = order at "
               "⚡ / Add & place. Price = the app waits until the LTP reaches your price (either way: ↓ a dip or "
               "↑ a breakout), then sends a market order. After the fill the Stoploss waits at the exchange (SL-M), "
-              "Trailing moves it and the Target is watched by the app (it turns the SL into MARKET). Limit and "
-              "Stop-limit come in BEP Upstox PR 4 (refused at ⚡ until then): use Market or Price.")
+              "Trailing moves it and the Target is watched by the app (it turns the SL into MARKET). Limit = a LIMIT "
+              "BUY at this price OR CHEAPER (fills at once if the LTP is already below it). Stop-limit = an SL BUY "
+              "that waits at the exchange until the LTP RISES to the trigger, then a limit at the limit price. "
+              "After the fill they get the same exchange SL / trailing / target. Deleting a card cancels its open "
+              "order (by its ID); unfilled orders are cancelled at 15:15.")
     for name in engine.active():
         step = config.INDEXES[name]["strike_interval"]
         with ui.card().classes("w-full"):
@@ -2257,8 +2296,8 @@ def orders_page():
             if engine.trail_text(r):
                 parts.append(engine.trail_text(r))
             r["rules_text"] = " \u00b7 ".join(parts) + (f" \u2192 {r['c_done']}" if r.get("c_done") else "")
-            r["cx_action"] = ("Retry cancel" if m["state"] == "CANCEL FAILED" else "Cancel order") \
-                if limit_orders.cancellable(m) else ""
+            r["cx_action"] = ("Retry cancel" if m and m["state"] == "CANCEL FAILED" else "Cancel order") \
+                if engine.entry_cancellable(r) else ""
             r["rules_edit"] = engine.order_rule_editable(r)
             sq = str(r.get("sq") or "")
             r["sq_action"] = "Retry square off" if sq.startswith("FAILED") and trade_tracker._f(r.get("exit")) is None \

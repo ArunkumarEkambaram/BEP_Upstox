@@ -11,6 +11,7 @@ Orders live in memory:
 """
 import itertools
 import time
+import uuid
 
 from . import base
 
@@ -25,7 +26,8 @@ class PaperBroker:
         self.orders = {}            # order_id -> dict
         self.last_ltp = {}          # instrument_key -> last LTP seen
         self._ids = itertools.count(1)
-        self._run = time.strftime("%H%M%S")      # IDs stay unique after an app restart (orders file keeps old ones)
+        # IDs stay unique after an app restart (the orders file keeps the old ones)
+        self._run = time.strftime("%H%M%S") + uuid.uuid4().hex[:3]
 
     def _new_id(self):
         return f"PAPER-{self._run}-{next(self._ids)}"

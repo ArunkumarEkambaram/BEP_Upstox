@@ -205,3 +205,125 @@ class Assumed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LimitEntries(unittest.TestCase):
+    """PR 4: Limit / Stop-limit entries, partial fills, cancel."""
+    def start(self, etype, price=0.0, trig=0.0, broker=None, ltp=135.0, plan=None):
+        b = broker or PaperBroker()
+        pm = P.PositionManager(b, sl_limit_gap=5, clock=Clock())
+        st = P.new_state(b.mode, "BEP-L", IK, 65, plan or {"sl": {"type": "POINT", "value": 17}}, ltp,
+                         etype=etype, eprice=price, etrig=trig)
+        pm.place_entry(st, bk.OrderRequest(IK, bk.BUY, 65, etype, price=price, trigger_price=trig, tag="BEP-L",
+                                           ref_price=ltp), "10:00:00")
+        return b, pm, st
+
+    def test_limit_waits_then_fills_and_gets_sl(self):
+        b, pm, st = self.start(bk.LIMIT, price=130, ltp=135)
+        tick(pm, st, 134)
+        self.assertIsNone(st["fill"])
+        self.assertEqual(P.entry_text(st), "LIMIT OPEN @ 130.00")
+        tick(pm, st, 129.5)
+        self.assertEqual((st["fill"], st["sl_trg"]), (129.5, 112.5))
+        self.assertFalse(P.entry_open(st))
+
+    def test_stop_limit(self):
+        b, pm, st = self.start(bk.SL, price=141, trig=140, ltp=135)
+        self.assertEqual(P.entry_text(st), "STOP @ 140.00 → LIMIT 141.00")
+        tick(pm, st, 138)
+        self.assertIsNone(st["fill"])
+        tick(pm, st, 140.5)                         # triggers and fills (140.5 <= 141)
+        self.assertEqual(st["fill"], 140.5)
+        self.assertEqual(st["sl_trg"], 123.5)
+
+    def test_cancel_unfilled(self):
+        b, pm, st = self.start(bk.LIMIT, price=130, ltp=135)
+        self.assertTrue(P.PositionManager.request_cancel(st, "Card deleted"))
+        ev = tick(pm, st, 134)
+        self.assertEqual(st["closed"], "entry cancelled")
+        self.assertIn("cancelled", kinds(ev))
+        self.assertEqual(b.status(st["entry_id"]).status, bk.CANCELLED)
+
+    def test_eod_cancels_unfilled(self):
+        b, pm, st = self.start(bk.SL, price=141, trig=140, ltp=135)
+        tick(pm, st, 135, eod=True)
+        self.assertEqual(st["closed"], "entry cancelled")
+
+    def test_exit_before_fill_cancels(self):
+        b, pm, st = self.start(bk.LIMIT, price=130, ltp=135)
+        P.PositionManager.request_exit(st, "Opponent SL", "10:05:00")
+        tick(pm, st, 134)
+        self.assertEqual(st["closed"], "entry cancelled")
+        self.assertEqual([o for o in b.orders.values() if o["side"] == bk.SELL], [])
+
+    def test_partial_fills_grow_the_sl_then_exit_cancels_rest(self):
+        class Partial(PaperBroker):
+            """The entry fills 65 of 130 first, then the test fills the rest by hand."""
+            def place(self, req):
+                res = super().place(req)
+                o = self.orders[res.order_id]
+                if req.side == bk.BUY and req.order_type == bk.LIMIT:
+                    o.update(status=bk.OPEN, filled_qty=65, pending_qty=65, avg_price=129.0)
+                    o["order_type"] = "X"            # keep on_ltp away from it
+                return res
+        b = Partial()
+        pm = P.PositionManager(b, sl_limit_gap=5, clock=Clock())
+        st = P.new_state("dry", "BEP-P", IK, 130, {"sl": {"type": "POINT", "value": 17}}, 135,
+                         etype=bk.LIMIT, eprice=130)
+        pm.place_entry(st, bk.OrderRequest(IK, bk.BUY, 130, bk.LIMIT, price=130, tag="BEP-P", ref_price=135),
+                       "10:00:00")
+        tick(pm, st, 131)
+        self.assertEqual((st["fill"], st["fill_qty"], st["sl_qty"]), (129.0, 65, 65))
+        self.assertTrue(P.entry_open(st))
+        self.assertEqual(P.entry_text(st), "FILLED 65 @ 129.00 · PARTIAL")
+        e = b.orders[st["entry_id"]]
+        e.update(status=bk.COMPLETE, filled_qty=130, pending_qty=0, avg_price=129.5)
+        tick(pm, st, 131)
+        self.assertEqual((st["fill"], st["fill_qty"], st["sl_qty"]), (129.5, 130, 130))
+        self.assertEqual(b.status(st["sl_id"]).quantity, 130)
+
+    def test_partial_then_exit_cancels_the_rest_first(self):
+        class Partial(PaperBroker):
+            def place(self, req):
+                res = super().place(req)
+                o = self.orders[res.order_id]
+                if req.side == bk.BUY and req.order_type == bk.LIMIT:
+                    o.update(status=bk.OPEN, filled_qty=65, pending_qty=65, avg_price=129.0, order_type="X")
+                return res
+        b = Partial()
+        pm = P.PositionManager(b, sl_limit_gap=5, clock=Clock())
+        st = P.new_state("dry", "BEP-P", IK, 130, {"sl": {"type": "POINT", "value": 17}}, 135,
+                         etype=bk.LIMIT, eprice=130)
+        pm.place_entry(st, bk.OrderRequest(IK, bk.BUY, 130, bk.LIMIT, price=130, tag="BEP-P", ref_price=135),
+                       "10:00:00")
+        tick(pm, st, 131)
+        P.PositionManager.request_exit(st, "Manual square-off", "10:01:00")
+        tick(pm, st, 131)                            # cancels the rest, then the SL (65) becomes MARKET
+        self.assertEqual(b.orders[st["entry_id"]]["status"], bk.CANCELLED)
+        tick(pm, st, 131)
+        self.assertEqual((st["exit"], st["exit_reason"]), (131.0, "Manual square-off"))
+        sells = [o for o in b.orders.values() if o["side"] == bk.SELL]
+        self.assertEqual([o["filled_qty"] for o in sells], [65])
+
+    def test_assumed_limit_and_cancel(self):
+        class Sandbox(PaperBroker):
+            mode = "sandbox"
+            capabilities = frozenset({bk.CAP_MODIFY, bk.CAP_CANCEL_BY_ID, bk.CAP_STOP_MARKET})
+        b, pm, st = self.start(bk.SL, price=141, trig=140, broker=Sandbox())
+        self.assertIsNone(st["fill"])                # not assumed filled when sent
+        tick(pm, st, 140.2)                          # assumed trigger + fill
+        self.assertEqual(st["fill"], 140.2)
+        b2, pm2, st2 = self.start(bk.LIMIT, price=130, broker=Sandbox())
+        P.PositionManager.request_cancel(st2, "Cancel")
+        tick(pm2, st2, 134)
+        self.assertEqual(st2["closed"], "entry cancelled")
+
+    def test_restart_lost_limit_is_placed_again(self):
+        b, pm, st = self.start(bk.LIMIT, price=130, ltp=135)
+        old = st["entry_id"]
+        pm2 = P.PositionManager(PaperBroker(), clock=Clock())
+        pm2.tick([(1, st, IK, 134)], "11:00:00")
+        self.assertNotEqual(st["entry_id"], old)
+        self.assertIsNone(st["fill"])
+        pm2.tick([(1, st, IK, 129)], "11:00:02")
+        self.assertEqual(st["fill"], 129.0)
