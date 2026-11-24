@@ -124,6 +124,14 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
    - Header: a red **MAX LOSS ₹2,350 / 2,000** badge once hit.
    - Checked: 58 unit tests (`tests/test_max_loss.py`: dry-run rows only, open P&L counts, 0 = off, not in Sandbox / Live, blocked / 09:15 exempt / Place anyway); Setup shows the field.
 
+## To port later (testing features in BEP-AlgoDelta only)
+- **09:15 second-side window (BEP-AlgoDelta decision 32, user 24 Nov: "a testing feature, add it later" here; not built in this app).** Once one side (CE or PE) has its 09:15 order, the other side may follow only within `open_second_side_secs` (60 s) of that order's time (CE at 09:15:20 → PE allowed until 09:16:20); after that the other side is **restricted** for the day.
+  - Only orders that lock a side start the window (here: an entry placed / dry run / failed); a BLOCKED order frees the side and doesn't.
+  - Both qualifying within 60 s → both placed. Log "PE 09:15 order restricted: CE was ordered at 09:15:20, more than 60 s ago"; Dashboard status "PE: restricted (CE at 09:15:20)".
+  - Setup "09:15 second side within (seconds, 0 = off)" in Order defaults, saved in settings.json.
+  - A restart restores the first order's time from the orders file. A restricted side doesn't skip the 09:15 ⭐ row.
+  - In BEP-AlgoDelta: `BepMonitor._restrict_second_side` (start of `opening_tick`), lock status `restricted`; `engine._add_star_rows` ignores restricted locks. Port the same when the user confirms the test result.
+
 ## Inherited from BEP-AlgoDelta (up to its PR #49)
 Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-AlgoDelta** PRs. **Since PR 3 here, every mention of AlgoDelta JSON, `order_bridge.py`, webhooks, `squareoff_position` / `cancel_order` or "AlgoDelta holds the SL / Target / trail" is replaced by decision 6 above** (the BEP logic, triggers, warnings and screens still apply). The Limit / Stop-limit parts come back in PR 4.
 ## Architecture (after PR #3)
