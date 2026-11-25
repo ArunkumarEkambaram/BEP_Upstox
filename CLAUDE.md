@@ -1,6 +1,6 @@
 # CLAUDE.md: BEP Upstox project context (read at the start of every session)
 
-Repo: `ArunkumarEkambaram/BEP_Upstox` (default branch `master`, latest merge = PR #17, CLAUDE.md hand-off of the 25 Nov session (last feature: PR #13, the 09:15 order's own trailing SL); updated together with each feature PR).
+Repo: `ArunkumarEkambaram/BEP_Upstox` (default branch `master`, latest merge = PR #17, CLAUDE.md hand-off of the 25 Nov session (last feature: PR #13, the 09:15 order's own trailing SL; next: the Manual Entry Stop-limit form check, decision 28); updated together with each feature PR).
 Run: `python app.py` → http://localhost:**8084** (`config.APP_PORT`). Needs `nicegui>=3.1.0`, Python 3.14 on the user's PC. Cloud server: `deploy/README.md` (PR 5).
 **What it is:** a copy of `ArunkumarEkambaram/BEP-AlgoDelta` (`main` at its PR #49, full history kept) that will send orders **directly to Upstox** (with a registered static IP, later on a cloud server) instead of through AlgoDelta. The BEP logic (Support board, ⭐, Pair cross, Replay, Order Management triggers, exit rules, Order Details) stays the same; the order path is replaced.
 Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until this one is proven live; port 8083; important BEP-logic fixes are ported to **both** apps until one is retired), `ArunkumarEkambaram/LTP_Crossing` (reference only, do not change).
@@ -403,6 +403,7 @@ Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-
      - Example: the 23 Nov 10:15 BEP cross 25500CE (BEP 167.57, LTP 156.60): Stop-limit sends `sl_order` trigger 167.57 → limit 168.57 and waits for the CE to rise back above its BEP.
      - Merged 23 Nov 2026; the user confirmed Stop-limit shows on Pair cards.
    - **Manual Entry default = Stop-limit (PR #40, user request 23 Nov):** the form opens on Stop-limit. The trigger is **not** pre-filled (it must be above the LTP; the LTP shows beside it); typing it fills the limit = trigger + 1. The LTP pre-fill of the price box now applies only to Price / Limit.
+   - **Form check (user, 25 Nov, all suggested):** Add card / Add & place refuse a Stop-limit whose trigger is at or below a **fresh LTP** (quoted at the click): "Stop-limit: the trigger 190.00 must be above the LTP 238.65. To buy on a dip, use Limit or Price." No LTP (not connected) → the card is added and ⚡ still checks. Why: a 190 trigger with LTP 238.65 was added and only ⚡ refused it. (Both apps.)
    - **Not yet tested live:** AlgoDelta `sl_order` → Upstox (order_type "SL", status names), and what `cancel_order` does to a trigger-pending order. Test with 1 lot. Merged 23 Nov 2026; the user confirmed the card shows correctly and planned the 1-lot live test on 24 Nov, but 24 Nov is a market holiday, so it moves to the next trading day.
 
 29. **Manual Entry BEP and Target "None" (PR #48, user request 23 Nov):**
