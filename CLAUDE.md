@@ -1,6 +1,6 @@
 # CLAUDE.md: BEP Upstox project context (read at the start of every session)
 
-Repo: `ArunkumarEkambaram/BEP_Upstox` (default branch `master`, latest merge = PR #18 (Manual Entry Stop-limit form check, decision 28); updated together with each feature PR).
+Repo: `ArunkumarEkambaram/BEP_Upstox` (default branch `master`, latest merge = PR #19 (Pair "Auto at 09:15", decision 13); updated together with each feature PR).
 Run: `python app.py` → http://localhost:**8084** (`config.APP_PORT`). Needs `nicegui>=3.1.0`, Python 3.14 on the user's PC. Cloud server: `deploy/README.md` (PR 5).
 **What it is:** a copy of `ArunkumarEkambaram/BEP-AlgoDelta` (`main` at its PR #49, full history kept) that will send orders **directly to Upstox** (with a registered static IP, later on a cloud server) instead of through AlgoDelta. The BEP logic (Support board, ⭐, Pair cross, Replay, Order Management triggers, exit rules, Order Details) stays the same; the order path is replaced.
 Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until this one is proven live; port 8083; important BEP-logic fixes are ported to **both** apps until one is retired), `ArunkumarEkambaram/LTP_Crossing` (reference only, do not change).
@@ -25,7 +25,7 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
 - **PR 5 (password login + cloud server scripts):** decision 8 below.
 - **PR 6 (NIFTY change % in the header):** decision 9 below (BEP-AlgoDelta PR #50).
 - **PR 7 (max loss per day, Dry run only, 09:15 exempt):** decision 10 below (BEP-AlgoDelta PR #52). All merged on 24 Nov 2026.
-- **Work branch:** PRs 1–8: `claude/dazzling-keller-bxdbcj`; PRs #9–#17: `claude/kind-knuth-vn2ga9` (the same name in BEP-AlgoDelta each time), recreated from `master` for each PR; the user deletes it after a merge. A new chat gets its own branch name.
+- **Work branch:** PRs 1–8: `claude/dazzling-keller-bxdbcj`; PRs #9–#17: `claude/kind-knuth-vn2ga9`; PRs #18–#20: `claude/zen-einstein-n2mc3f` (the same name in BEP-AlgoDelta each time), recreated from `master` for each PR; the user deletes it after a merge. A new chat gets its own branch name.
 - **Next:** set up the server together with the user (outside market hours), Dry run / Sandbox on trading days (including the max loss: a low test limit, e.g. ₹100, to see the popup, the header badge and a BLOCKED PENDING card), then 1-lot live tests once the static IP is registered. Max loss for Sandbox / Live is to be decided after the dry-run test.
 
 - The plan as agreed in BEP-AlgoDelta on 23 Nov 2026 (copied unchanged; "this app" there means BEP-AlgoDelta):
@@ -145,6 +145,7 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
    - Alert: toast + notification "NIFTY AUTO ORDER Pair 25800CE / 25800PE @ 200: 25800CE DRY RUN" and Log lines.
    - Checked (simulated ticks, dry run, both apps): no order before 09:15; CE above but not crossed → nothing; CE dips to 199 then 203 → ordered; gap-up row → nothing, normal Pair after 09:20; same option open → skipped; both crossing → the bigger move; switch OFF → nothing; Pair page renders the switch / AUTO chip without errors. BEP_Upstox: 58 unit tests pass.
 
+- **Session notes (25 Nov afternoon / evening, PRs #18–#19; details in BEP-AlgoDelta's CLAUDE.md "Session notes (25 Nov 2026 afternoon / evening)"):** merged here: #18 Manual Entry Stop-limit form check (decision 28 note), #19 Pair "Auto at 09:15" (decision 13). Not ported (not needed): BEP-AlgoDelta #63, the app-held Target for Strategy orders (decision 36 there); this app's target is already app-held and replaceable. Tomorrow (26 Nov): try Auto at 09:15 in Dry run (Strategy or Limit; set the card's Target / SL / Trail first).
 - **Session notes (24–25 Nov, PRs #9–#17; the details are in BEP-AlgoDelta's CLAUDE.md "Session notes"):** merged here: #11 Setup sections (decision 11), #13 09:15 trailing SL (decision 12), #9 / #15 "To port later" notes, the rest CLAUDE.md only. The "latest merge" line is updated inside the next feature PR. Trailing here is always app-held: it can be changed or removed on an open order (card Trailing box or Order Details; Remove leaves the exchange SL where it is; to lower the SL set the Stoploss itself). Orders per second: well under the 10 OPS line in normal use (it counts order messages, not lots); no rate limiter yet, one was offered.
 
 ## To port later (testing features in BEP-AlgoDelta only)
