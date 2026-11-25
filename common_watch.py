@@ -216,7 +216,7 @@ class CommonWatch:
         return changed
 
     def add_pair(self, ce_strike: int, pe_strike: int, ce_price: float, pe_price: float, buffer: float, tf: int,
-                 now=None, mode: str = None, trig_on: str = "close") -> dict:
+                 now=None, mode: str = None, trig_on: str = "close", auto_open: bool = False) -> dict:
         now = now or datetime.now(IST)
         self._roll_day(now)
         self._seq += 1
@@ -229,11 +229,32 @@ class CommonWatch:
                "opt": "", "strike": None, "price": None, "trig_time": "", "trig_close": None,
                "last_close": None, "last_time": "", "fail_time": "", "fail_close": None,
                "opp_close": None, "exit_close": None, "order_status": "", "order_id": None, "squareoff": "",
-               "trig_on": "ltp" if trig_on == "ltp" else "close"}
+               "trig_on": "ltp" if trig_on == "ltp" else "close",
+               "auto_open": bool(auto_open)}         # "Auto at 09:15": placed by itself on the first cross above
         self._apply_mode(row, mode)
         self.rows.append(row)
         self.save()
         return row
+
+    @staticmethod
+    def auto_window(now) -> bool:
+        """The "Auto at 09:15" window of a Pair row: PAIR_AUTO_FROM <= time < PAIR_AUTO_TO (09:15:00-09:20:00)."""
+        t = now.astimezone(IST).strftime("%H:%M:%S")
+        return config.PAIR_AUTO_FROM <= t < config.PAIR_AUTO_TO
+
+    @staticmethod
+    def auto_active(r, now) -> bool:
+        return bool(r.get("auto_open")) and r.get("kind") == "pair" and r.get("auto") != "cross" \
+            and r["status"] == "watching" and CommonWatch.auto_window(now)
+
+    def set_auto(self, row_id: int, on: bool) -> bool:
+        """Turns "Auto at 09:15" on / off for a Pair row (not a BEP cross row) while it is still watching."""
+        r = self.get(row_id)
+        if not r or r.get("kind") != "pair" or r.get("auto") == "cross" or r["status"] != "watching":
+            return False
+        r["auto_open"] = bool(on)
+        self.save()
+        return True
 
     @staticmethod
     def _apply_mode(r, mode):
@@ -442,7 +463,8 @@ class CommonWatch:
                         r["legs"][o]["armed"] = True          # has been at or below its price since the row was added
                     if datetime.fromisoformat(t) >= added_at and lows[o].get(t, close) <= price[o]:
                         r["legs"][o]["armed"] = True          # a wick to the price counts too
-                    if r["legs"][o].get("armed") and close > price[o] and closes[opp][t] < line[opp]:
+                    if r["legs"][o].get("armed") and close > price[o] and closes[opp][t] < line[opp] \
+                            and not self.auto_active(r, now):
                         strike = r["ce_strike"] if o == "CE" else r["pe_strike"]
                         r.update(status="triggered", opt=o, strike=strike, price=price[o], trig_time=label,
                                  trig_close=close, last_close=close, last_time=label)
@@ -481,6 +503,23 @@ class CommonWatch:
                     if lt[o] is not None and lt[o] <= price[o] and not r["legs"][o].get("armed"):
                         r["legs"][o]["armed"] = True
                         changed = True
+                if self.auto_active(r, now):           # "Auto at 09:15": the first leg to CROSS above its price
+                    for o in ("CE", "PE"):             # (at or below it at some point from 09:15, then above)
+                        if lt[o] is not None and lt[o] <= price[o] and not r["legs"][o].get("auto_below"):
+                            r["legs"][o]["auto_below"] = True
+                            changed = True
+                    cands = [(lt[o] - price[o], o) for o in ("CE", "PE")
+                             if r["legs"][o].get("auto_below") and lt[o] is not None and lt[o] > price[o]]
+                    if cands:                          # both in the same check: the one more points above
+                        o = max(cands)[1]
+                        opp = "PE" if o == "CE" else "CE"
+                        strike = r["ce_strike"] if o == "CE" else r["pe_strike"]
+                        r.update(status="triggered", opt=o, strike=strike, price=price[o], trig_time=label,
+                                 trig_close=lt[o], last_close=lt[o], last_time=label, trig_how="auto",
+                                 trig_opp=lt[opp])
+                        fired.append(dict(r))
+                        changed = True
+                    continue                           # no normal trigger while the auto window is on
                 if r.get("trig_on") != "ltp" or None in lt.values():
                     continue
                 for o, opp in (("CE", "PE"), ("PE", "CE")):
@@ -536,8 +575,21 @@ class CommonWatch:
         if r.get("kind") == "pair":
             opp = "PE" if r.get("opt") == "CE" else "CE"
             if r["status"] == "watching":
+                if r.get("auto_open") and r.get("auto") != "cross":
+                    now = datetime.now(IST)
+                    t = now.strftime("%H:%M:%S")
+                    if t < config.PAIR_AUTO_TO:
+                        legs = [o for o in ("CE", "PE") if r["legs"][o].get("auto_below")]
+                        return (f"AUTO {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}: the first leg whose "
+                                "live LTP crosses above its price is ordered \u00b7 "
+                                + ((" + ".join(legs) + " at or below its price") if legs else
+                                   "no leg at or below its price yet"))
+                    return (f"Auto ended at {config.PAIR_AUTO_TO[:5]} (no cross) \u00b7 normal Pair: "
+                            "watching both legs \u00b7 " + CommonWatch.armed_text(r))
                 return "Watching both legs \u00b7 " + CommonWatch.armed_text(r)
-            text = (f"{r['opt']} LTP above at {r['trig_time']}, LTP {r['trig_close']:.2f}" if r.get("trig_how") == "ltp"
+            text = (f"AUTO: {r['opt']} LTP crossed above {r['price']:g} at {r['trig_time']}, LTP {r['trig_close']:.2f}"
+                    if r.get("trig_how") == "auto" else
+                    f"{r['opt']} LTP above at {r['trig_time']}, LTP {r['trig_close']:.2f}" if r.get("trig_how") == "ltp"
                     else f"{r['opt']} closed above at {r['trig_time']}, close {r['trig_close']:.2f}")
             if r.get("auto") == "cross":
                 text = f"BEP cross {r['trig_time']}: {r['opt']} closed {r['trig_close']:.2f} above BEP"
