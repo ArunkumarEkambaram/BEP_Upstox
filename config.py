@@ -42,6 +42,8 @@ STOP_LIMIT_GAP = 1.0              # Manual Stop-limit: default limit price = tri
 # below and just above it (same two for CE and PE) and looks up their BEPs. From 09:15:00 to 09:20 it checks
 # only those strikes every OPENING_TICK_SECONDS with one Upstox call. Not prepared before 09:15 = no order today.
 OPENING_PREP_START = "09:08"
+PAIR_AUTO_FROM = "09:15:00"        # Pair "Auto at 09:15": active from (incl.) ...
+PAIR_AUTO_TO = "09:20:00"          # ... until (excl.); after it the row is a normal Pair (alert + ⚡)
 OPENING_TICK_SECONDS = 1
 
 # Live scan interval (seconds).

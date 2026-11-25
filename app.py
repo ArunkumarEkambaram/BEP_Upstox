@@ -1650,6 +1650,16 @@ def order_card(name, r, place, live):
                 if r.get("auto") == "cross":
                     ui.badge(f"BEP cross {r.get('trig_time', '')}").props("color=teal-8") \
                         .tooltip("Added automatically by BEP Support > BEP Pair cross (prices = BEPs, buffer 0)")
+                if r.get("trig_how") == "auto":
+                    ui.badge(f"AUTO {r.get('trig_time', '')}").props("color=deep-orange-8") \
+                        .tooltip(f"Ordered by itself: {r.get('opt')} LTP crossed above its price (Auto at "
+                                 f"{config.PAIR_AUTO_FROM[:5]})")
+                elif r.get("kind") == "pair" and r.get("auto") != "cross" and r["status"] == "watching":
+                    ui.switch(f"Auto at {config.PAIR_AUTO_FROM[:5]}", value=bool(r.get("auto_open")),
+                              on_change=lambda e, rid=r["id"]: engine.set_watch_auto(name, rid, e.value)) \
+                        .props("dense color=deep-orange").classes("text-xs") \
+                        .tooltip(f"{config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}: the first leg whose live LTP "
+                                 "crosses above its price is ordered by itself (no ⚡, no popups).")
             with ui.row().classes("items-center gap-2 no-wrap"):
                 chip = ui.badge(state).props(f"color={_chip_colour(state)}").classes("text-sm px-2 py-1")
                 if order is not None and (engine.is_open(order) or str(order.get("sq") or "").startswith("FAILED")) \
@@ -1813,7 +1823,8 @@ def om_header(title, help_text):
             OM_VIEW["compact"] = bool(ev.value)
             engine.bump("watch")                          # redraw the lists in the new view
         sw.on_value_change(flip)
-    ui.label(help_text + " Nothing is placed automatically: use ⚡ Place order.").classes("text-xs opacity-70")
+    ui.label(help_text + (" Only Pair rows with Auto at 09:15 place by themselves; everything else waits for ⚡ Place order."
+                          if "Auto at 09:15" in help_text else " Nothing is placed automatically: use ⚡ Place order.")).classes("text-xs opacity-70")
 
 
 def sl_warning(rule, ref, ref_name) -> str:
@@ -2119,7 +2130,9 @@ def same_strike_page():
 def pair_page():
     om_header("Pair (CE vs PE)", "Entry: a leg closes above its price while the opponent closes below price − "
               "buffer (the leg must have been at or below its price first). After you order, the opponent closing "
-              "back at or above that line squares off the position (live) or records the exit (dry run).")
+              "back at or above that line squares off the position (live) or records the exit (dry run). "
+              "Auto at 09:15 (switch): 09:15-09:20 the first leg whose live LTP crosses above its price is ORDERED "
+              "BY ITSELF (no opponent check); after 09:20 with no cross the row is a normal Pair.")
     for name in engine.active():
         step = config.INDEXES[name]["strike_interval"]
         with ui.card().classes("w-full"):
@@ -2137,9 +2150,13 @@ def pair_page():
                 tf = tf_radio()
                 trig = trig_toggle()
                 omode = order_mode_toggle()
+                auto_sw = ui.switch(f"Auto at {config.PAIR_AUTO_FROM[:5]}", value=False) \
+                    .tooltip(f"{config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}: the first leg whose live LTP "
+                             "crosses above its price (at or below it first) is ORDERED BY ITSELF, no opponent check. "
+                             f"After {config.PAIR_AUTO_TO[:5]} with no cross: a normal Pair row (alert + ⚡).")
 
                 def add(name=name, step=step, p_ce=p_ce, p_pe=p_pe, p_price=p_price, p_pe_price=p_pe_price,
-                        p_buffer=p_buffer, tf=tf, omode=omode, trig=trig):
+                        p_buffer=p_buffer, tf=tf, omode=omode, trig=trig, auto_sw=auto_sw):
                     try:
                         ce, pe, price = int(p_ce.value), int(p_pe.value), float(p_price.value)
                         pe_price = float(p_pe_price.value) if p_pe_price.value else price
@@ -2152,8 +2169,11 @@ def pair_page():
                                   type="negative")
                         return
                     om = omode.value if omode.value != "strategy" else None
-                    engine.add_pair(name, ce, pe, price, pe_price, buffer, int(tf.value), om, trig.value)
+                    engine.add_pair(name, ce, pe, price, pe_price, buffer, int(tf.value), om, trig.value,
+                                    bool(auto_sw.value))
                     ui.notify(f"Watching pair {ce}CE / {pe}PE at {price:g}, "
+                              + (f"AUTO order at {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}, "
+                                 if auto_sw.value else "")
                               + ("STOP-LIMIT order at the fired leg's price." if om == "stoplimit" else
                                  "LIMIT order at the fired leg's price." if om else "strategy order."), type="positive")
                 ui.button("Add", icon="add", on_click=add)
