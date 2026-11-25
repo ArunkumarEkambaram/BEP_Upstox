@@ -2275,15 +2275,30 @@ def manual_page():
                     return None
                 return k, opt.value, q, p, ("limit" if mode.value in ("limit", "stoplimit") else None), t
 
-            def add(name=name, validated=validated):
+            async def checked(name=name, validated=validated, ltp_lbl=ltp_lbl):
+                """validated() + Stop-limit: the trigger must be above a fresh LTP (else it would trigger at once and
+                ⚡ refuses it). No LTP (not connected) -> added anyway, ⚡ still checks."""
                 v = validated()
+                if not v or v[5] is None:
+                    return v
+                ltp = await engine.quote_option(name, v[0], v[1])
+                if ltp is not None:
+                    ltp_lbl.set_text(f"{ltp:.2f}")
+                if ltp is not None and v[5] <= ltp:
+                    ui.notify(f"Stop-limit: the trigger {v[5]:.2f} must be above the LTP {ltp:.2f}. "
+                              "To buy on a dip, use Limit or Price.", type="negative", multi_line=True)
+                    return None
+                return v
+
+            async def add(name=name, checked=checked):
+                v = await checked()
                 if v:
                     engine.add_manual(name, *v)
                     ui.notify(f"Manual entry card added: {v[0]}{v[1]}. Set Target / SL / Trailing on the card, "
                               "then ⚡.", type="positive")
 
-            async def add_and_place(name=name, validated=validated):
-                v = validated()
+            async def add_and_place(name=name, checked=checked):
+                v = await checked()
                 if not v:
                     return
                 r = engine.add_manual(name, *v)
