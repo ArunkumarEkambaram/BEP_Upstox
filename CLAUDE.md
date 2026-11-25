@@ -143,6 +143,9 @@ Related repos: `ArunkumarEkambaram/BEP-AlgoDelta` (the app in daily use until th
   - Setup (Order defaults): a **"09:15 second side window" switch** (ON by default, `open_second_side`) + "Second side within (seconds)" (60, > 0, greyed out when OFF, `open_second_side_secs`), saved in settings.json. OFF = each side any time 09:15–09:20.
   - A restart restores the first order's time from the orders file. A restricted side doesn't skip the 09:15 ⭐ row.
   - In BEP-AlgoDelta: `BepMonitor._restrict_second_side` (start of `opening_tick`), lock status `restricted`; `engine._add_star_rows` ignores restricted locks. Port the same when the user confirms the test result.
+- **09:15: skip the first signal (BEP-AlgoDelta decision 35, user 25 Nov: testing feature; not built here).** Each side's 1st 09:15 signal is not ordered; the order goes on the 2nd: a strike of that side whose LTP fell back below BEP + `open_entry_above` after the 1st and then meets all the rules again (touch, LTP > open, ≥ BEP + 2, < BEP + 15) before 09:20 (per side, either strike). No 2nd signal = no 09:15 order for that side.
+  - Setup › 09:15 opening order: "09:15: skip the first signal" switch (ON by default, `open_skip_first`, saved). The second-side window counts from the first order placed. Skip state in memory (a restart starts over).
+  - In BEP-AlgoDelta: `BepMonitor._first_skip` in `opening_tick` (the `dipped` set per side), `side_status_text`. Port the same when the user confirms the test result.
 
 ## Inherited from BEP-AlgoDelta (up to its PR #49)
 Everything below describes the app as copied. PR numbers (#2 … #49) are **BEP-AlgoDelta** PRs. **Since PR 3 here, every mention of AlgoDelta JSON, `order_bridge.py`, webhooks, `squareoff_position` / `cancel_order` or "AlgoDelta holds the SL / Target / trail" is replaced by decision 6 above** (the BEP logic, triggers, warnings and screens still apply). The Limit / Stop-limit parts come back in PR 4.
