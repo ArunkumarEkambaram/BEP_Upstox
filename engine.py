@@ -13,12 +13,13 @@ import json
 import os
 from datetime import datetime
 
-from nicegui import run
+from nicegui import background_tasks, run
 
 import bep
 import brokers
 import config
 import exit_rules
+import gift_nifty
 import limit_orders
 import market_utils
 import notifier
@@ -67,6 +68,8 @@ class Engine:
         self.status = "Waiting for a valid Upstox token (Setup page)"
         self.ltp = {n: None for n in config.INDEXES}
         self.ltp_change = {n: None for n in config.INDEXES}     # index points vs the previous close (header %)
+        self.gift = gift_nifty.GiftNifty()                   # GIFT Nifty for the header (every 30 s)
+        self._gift_busy = False
         self.option_ltp = {}                                 # (index, strike, opt) -> live LTP for Order Management cards
         self._opt_ltp_busy = False
         self.log_lines = []
@@ -135,6 +138,18 @@ class Engine:
         if not out and len(names) == 1 and len(ltp_map) == 1:
             out[names[0]] = next(iter(ltp_map.values()))
         return out, err
+
+    async def refresh_gift(self):
+        """GIFT Nifty for the header (gift_nifty.py): at most one quote call per 30 s; the key is read once a day."""
+        logs = []
+        try:
+            await run.io_bound(self.gift.poll, self.client, _now().strftime("%Y-%m-%d"), logs.append)
+        except Exception as e:                                # never let the header value break the scan
+            logs.append(f"GIFT NIFTY refresh failed: {e}")
+        finally:
+            self._gift_busy = False
+        for m in logs:
+            self.log(m)
 
     def index_change(self, name):
         """(points, percent) vs the previous close, or None."""
@@ -1192,6 +1207,10 @@ class Engine:
         if not self.connected:
             self.status = "Waiting for a valid Upstox token (Setup page)"
             return
+        active = self.active()
+        if not self._gift_busy and self.gift.due():          # GIFT Nifty: its own task, never delays the scan
+            self._gift_busy = True
+            background_tasks.create(self.refresh_gift())
         active = self.active()
         if not active or self._scan_busy:
             return

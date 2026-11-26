@@ -251,6 +251,11 @@ def root():
         with ui.row().classes("items-center gap-2 no-wrap bg-slate-800 rounded px-2 py-1"):
             ltp_lbl = ui.label("").classes("text-sm")
             chg_lbl = ui.label("").classes("text-sm font-medium")
+        with ui.row().classes("items-center gap-2 no-wrap bg-slate-800 rounded px-2 py-1") as gift_chip:
+            gift_lbl = ui.label("").classes("text-sm")
+            gift_chg = ui.label("").classes("text-sm font-medium")
+            gift_gap = ui.label("").classes("text-xs opacity-80")
+            gift_tip = ui.tooltip("")
         status_lbl = ui.label("").classes("text-sm opacity-80")
         ui.space()
         conn_badge = ui.badge("").props("rounded")
@@ -277,6 +282,19 @@ def root():
         chg_lbl.classes(remove="text-green-5 text-red-5")
         if ch:
             chg_lbl.classes(add="text-green-5" if ch[0] >= 0 else "text-red-5")
+        g = engine.gift                                              # GIFT Nifty (gift_nifty.py, every 30 s)
+        gift_lbl.set_text(f"GIFT NIFTY {g.ltp:,.2f}" if g.ltp is not None else "GIFT NIFTY --")
+        gch = g.change()
+        gift_chg.set_text(f"{gch[0]:+,.2f} ({gch[1]:+.2f}%)" if gch else "")
+        gift_chg.classes(remove="text-green-5 text-red-5")
+        if gch:
+            gift_chg.classes(add="text-green-5" if gch[0] >= 0 else "text-red-5")
+        gap = g.gap(engine.ltp.get(names[0])) if names else None
+        gift_gap.set_text(f"{gap:+,.2f} vs NIFTY" if gap is not None else "")
+        gift_chip.classes(remove="opacity-50")
+        if g.stale():
+            gift_chip.classes(add="opacity-50")
+        gift_tip.set_text(g.tooltip())
         status_lbl.set_text(engine.status)
         conn_badge.set_text("UPSTOX ✓ " + engine.user_name if engine.connected else "UPSTOX ✗")
         conn_badge.props("color=" + ("green-8" if engine.connected else "grey-7"))
