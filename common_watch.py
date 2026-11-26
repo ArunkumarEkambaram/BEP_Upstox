@@ -238,7 +238,7 @@ class CommonWatch:
 
     @staticmethod
     def auto_window(now) -> bool:
-        """The "Auto at 09:15" window of a Pair row: PAIR_AUTO_FROM <= time < PAIR_AUTO_TO (09:15:00-09:20:00)."""
+        """The "Auto at 09:15" window of a Pair row: PAIR_AUTO_FROM <= time < PAIR_AUTO_TO (09:15:00-09:30:00)."""
         t = now.astimezone(IST).strftime("%H:%M:%S")
         return config.PAIR_AUTO_FROM <= t < config.PAIR_AUTO_TO
 
