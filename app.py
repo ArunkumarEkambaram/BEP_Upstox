@@ -87,8 +87,7 @@ OM_ROOT = "/order-management"
 # Order Management sub-pages: (path, icon, label, row kind). Add a tuple here (and a page builder) for a new one.
 OM_SUB = [
     (OM_ROOT + "/same-strike", "price_change", "Same strike", "same"),
-    (OM_ROOT + "/pair", "compare_arrows", "Pair (CE vs PE)", "pair"),
-    (OM_ROOT + "/bep-star", "star", "BEP Support \u2b50", "star"),
+    (OM_ROOT + "/pair-star", "compare_arrows", "Pair & \u2b50", "pairstar"),   # Pair, BEP cross and \u2b50 cards
     (OM_ROOT + "/manual-entry", "edit_note", "Manual Entry", "manual"),
 ]
 SUPPORT_ROOT = "/support"
@@ -118,6 +117,11 @@ CSS = """
   .nav-active { background: rgba(59,130,246,.18); color: #60a5fa; font-weight: 600; }
   /* alerts (PR #36): small toasts top-right, below the header */
   .q-notifications__list--top.items-end { top: 60px; }
+  .om-trig { border: 2px solid #22c55e !important; background: rgba(34,197,94,0.13) !important;
+             animation: om-glow 1.6s ease-in-out infinite; }
+  @keyframes om-glow { 0%, 100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
+                       50% { box-shadow: 0 0 16px 4px rgba(34,197,94,0.75); } }
+  .om-fail { border: 2px solid #b91c1c !important; }
   .bep-toast { max-width: 360px; min-width: 0; font-size: 13px; white-space: pre-line; padding: 4px 10px; }
   .bep-toast .q-notification__actions .q-btn { color: #fff !important; min-height: 0; padding: 0 4px; }
   .nav-sub { margin-left: 24px; min-height: 36px; white-space: nowrap; }
@@ -142,12 +146,13 @@ def when_changed(keys, fn, interval: float = 1.0):
 
 
 def om_rows(kind, name=None):
-    """Order Management rows of one kind ("same" / "pair" / "star") for one index, or for all active ones."""
+    """Order Management rows of one kind ("same" / "pair" / "star" / "manual"; "pairstar" = Pair + ⭐) for one index, or for all active ones."""
     out = []
     for n in ([name] if name else engine.active()):
         for r in engine.watches[n].rows:
             src = r.get("source")
-            if (src if src in ("pair", "star", "manual") else "same") == kind:
+            k = src if src in ("pair", "star", "manual") else "same"
+            if k == kind or (kind == "pairstar" and k in ("pair", "star")):
                 out.append(r)
     return out
 
@@ -397,10 +402,11 @@ def root():
 
     routes = {path: page(path, b) for path, b in (
         ("/", dashboard_page), (SUPPORT_SUB[0][0], support_page), (SUPPORT_SUB[1][0], pair_cross_page),
-        (OM_SUB[0][0], same_strike_page), (OM_SUB[1][0], pair_page), (OM_SUB[2][0], star_page),
-        (OM_SUB[3][0], manual_page),
+        (OM_SUB[0][0], same_strike_page), (OM_SUB[1][0], pair_star_page), (OM_SUB[2][0], manual_page),
         ("/order-details", orders_page), ("/setup", setup_page), ("/logs", logs_page))}
     routes[OM_ROOT] = page(OM_SUB[0][0], same_strike_page)        # old link: opens Same strike
+    for old in ("/pair", "/bep-star"):                             # old links: the merged Pair & \u2b50 page
+        routes[OM_ROOT + old] = page(OM_SUB[1][0], pair_star_page)
     routes[SUPPORT_ROOT] = page(SUPPORT_SUB[0][0], support_page)  # old link: opens the Support board
     ui.sub_pages(routes).classes("w-full")
 
@@ -1702,15 +1708,15 @@ def entry_price_box(name, r, pending):
     ui.label("market at \u26a1" if not price else f"wait LTP {sign}price, then market").classes("text-xs opacity-60")
 
 
-def order_card(name, r, place, live):
+def order_card(name, r, place, live, note=None):
     """One Order Management row as a card. `live` collects callbacks that refresh LTP / Entry / P&L / status."""
     order = engine.row_order(r)
     state = card_state(r, order)
     done = (r.get("order_status") or "") in ORDER_DONE
     pending = r.get("order_status") == "PENDING"
     locked = done
-    border = {"FAILED": "#b91c1c", "TRIGGERED": "#15803d"}.get(state)
-    with ui.card().classes("w-full gap-2").style(f"border: 1px solid {border}" if border else ""):
+    glow = {"TRIGGERED": "om-trig", "FAILED": "om-fail"}.get(state, "")   # TRIGGERED: waiting for \u26a1 (pulses)
+    with ui.card().classes("w-full gap-2 " + glow):
         with ui.row().classes("w-full items-center justify-between no-wrap"):
             with ui.row().classes("items-center gap-2"):
                 fired = r.get("kind") == "pair" and r.get("opt")   # a Pair leg fired: only that leg is shown
@@ -1727,6 +1733,12 @@ def order_card(name, r, place, live):
                     ui.badge(f"{r['opt']} fired").props("color=grey-8") \
                         .tooltip(f"{CommonWatch.pair_title(r)} \u00b7 the other leg is still watched for the "
                                  "opponent rule (FAILED before \u26a1, opponent SL after)")
+                if r.get("kind") == "pair" and r.get("auto") != "cross":
+                    ui.badge("Pair").props("color=blue-grey-7")
+                if note:
+                    ui.badge(note).props("color=orange-9").tooltip(
+                        "A \u2b50 card and a Pair card are on the same option: placing both buys it twice "
+                        "(the 'option already open' check still asks at \u26a1).")
                 if r.get("auto") == "cross":
                     ui.badge(f"BEP cross {r.get('trig_time', '')}").props("color=teal-8") \
                         .tooltip("Added automatically by BEP Support > BEP Pair cross (prices = BEPs, buffer 0)")
@@ -1901,12 +1913,28 @@ def order_card(name, r, place, live):
     live.append(refresh)
 
 
-def card_list(name, rows, place, live, empty_text):
+def card_rank(r) -> int:
+    """Card order on the Pair & \u2b50 page: 0 waiting for \u26a1 (TRIGGERED / BLOCKED / ORDER FAILED), 1 ordered /
+    open / pending, 2 WAITING, 3 FAILED / EXITED / CANCELLED."""
+    state = card_state(r, engine.row_order(r))
+    if state in ("TRIGGERED", "BLOCKED", "ORDER FAILED"):
+        return 0
+    if state == "WAITING":
+        return 2
+    if state in ("FAILED", "EXITED", "CANCELLED") or state.startswith("EXITED"):
+        return 3
+    return 1
+
+
+def card_list(name, rows, place, live, empty_text, ranked=False, notes=None):
     if not rows:
         ui.label(empty_text).classes("text-sm opacity-70")
         return
-    for r in sorted(rows, key=lambda x: x["id"], reverse=True):     # newest first
-        order_card(name, r, place, live)
+    rows = sorted(rows, key=lambda x: x["id"], reverse=True)       # newest first
+    if ranked:
+        rows = sorted(rows, key=card_rank)                         # stable: newest first inside each group
+    for r in rows:
+        order_card(name, r, place, live, (notes or {}).get(r["id"]))
 
 
 def om_header(title, help_text):
@@ -2226,8 +2254,10 @@ def same_strike_page():
         om_list(name, "watched strikes", "visibility", draw)
 
 
-def pair_page():
-    om_header("Pair (CE vs PE)", "Entry: a leg closes above its price while the opponent closes below price − "
+def pair_star_page():
+    om_header("Pair & \u2b50", "Pair, BEP cross and \u2b50 cards in one list (filter above the cards; "
+              "TRIGGERED first). \u2b50 cards are added automatically for a live first support inside the ATM "
+              "window (level = BEP) and turn red when the BEP Support board row fails. Pair entry: a leg closes above its price while the opponent closes below price − "
               "buffer (the leg must have been at or below its price first). After you order, the opponent closing "
               "back at or above that line squares off the position (live) or records the exit (dry run). "
               f"Auto at 09:15 (switch): {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg whose live LTP crosses above its price is ORDERED "
@@ -2278,27 +2308,100 @@ def pair_page():
                 ui.button("Add", icon="add", on_click=add)
 
         def draw(place, live, compact, name=name):
-            rows = om_rows("pair", name)
+            rows = om_rows("pairstar", name)
+            pairstar_filter(rows)
+            shown = [r for r in rows if PS_FILTER["kind"] in ("all", row_type(r))]
+            empty = ("No pairs or \u2b50 yet - add a pair above; \u2b50 and BEP cross cards appear automatically."
+                     if PS_FILTER["kind"] == "all" else "No cards of this type.")
+            notes = same_option_notes(rows)
             if compact:
-                pair_section(rows, place, name)
+                pairstar_section(shown, place, name, notes, empty)
             else:
-                card_list(name, rows, place, live, "No pairs yet - add one above.")
-        om_list(name, "watched pairs", "visibility", draw)
+                card_list(name, shown, place, live, empty, ranked=True, notes=notes)
+        om_list(name, "pairs and first supports", "visibility", draw)
 
 
-def star_page():
-    om_header("BEP Support ⭐", "Rows are added automatically for a live first support of the day inside the ATM "
-              "window (Level = BEP) and are ready to order. Red when the BEP Support board row fails. A 09:15 ⭐ is "
-              "skipped if that side already has its opening order.")
-    for name in engine.active():
-        def draw(place, live, compact, name=name):
-            rows = om_rows("star", name)
-            empty = "No ⭐ yet - live first supports inside the ATM window appear here automatically."
-            if compact:
-                section(f"BEP Support ⭐ ({len(rows)})", "star", rows, empty, place, name)
+PS_FILTER = {"kind": "all"}                       # Pair & \u2b50 page filter, shared by every tab
+PS_KINDS = {"all": "All", "pair": "Pair", "cross": "BEP cross", "star": "\u2b50"}
+
+
+def row_type(r) -> str:
+    """"star" (BEP Support \u2b50), "cross" (added by BEP Pair cross) or "pair" (your own Pair row)."""
+    if r.get("source") == "star":
+        return "star"
+    return "cross" if r.get("auto") == "cross" else "pair"
+
+
+def pairstar_filter(rows):
+    """Filter chips All / Pair / BEP cross / \u2b50 with counts."""
+    counts = {k: (len(rows) if k == "all" else sum(row_type(r) == k for r in rows)) for k in PS_KINDS}
+
+    def pick(k):
+        PS_FILTER["kind"] = k
+        engine.bump("watch")
+    with ui.row().classes("items-center gap-2"):
+        for k, label in PS_KINDS.items():
+            ui.button(f"{label} ({counts[k]})", on_click=lambda _e, k=k: pick(k)) \
+                .props("dense no-caps unelevated rounded size=sm color="
+                       + ("primary" if PS_FILTER["kind"] == k else "grey-8"))
+
+
+def same_option_notes(rows) -> dict:
+    """{row id: note} for live \u2b50 and Pair cards on the same option (strike + CE/PE; a Pair once a leg fired)."""
+    seen = {}
+    for r in rows:
+        if not r.get("opt") or r["status"] in ("failed", "exited"):
+            continue
+        state = card_state(r, engine.row_order(r))
+        if state in ("FAILED", "CANCELLED") or state.startswith("EXITED"):
+            continue
+        seen.setdefault((r.get("strike"), r["opt"]), []).append(r)
+    notes = {}
+    for group in seen.values():
+        if {row_type(r) == "star" for r in group} == {True, False}:
+            for r in group:
+                notes[r["id"]] = ("Same option as a Pair card" if row_type(r) == "star"
+                                  else "Same option as a \u2b50 card")
+    return notes
+
+
+def pairstar_section(rows, place, name, notes, empty_text):
+    """Compact view of the Pair & \u2b50 page: one table with a Type column."""
+    card_title(f"Pair & \u2b50 ({len(rows)})", "compare_arrows")
+    if not rows:
+        ui.label(empty_text).classes("text-sm opacity-70")
+        return
+    with ui.grid(columns="80px 210px 55px 120px minmax(240px, 1fr) 110px 210px 170px").classes("w-full items-center gap-x-3 gap-y-1"):
+        for head in ("Type", "Option / Pair \u00b7 level", "TF", "Last close", "Status", "Order", "SL / Target", ""):
+            ui.label(head).classes("stat-label")
+        for r in sorted(sorted(rows, key=lambda x: x["id"], reverse=True), key=card_rank):
+            bg = {"triggered": "bg-green-10 text-green-2", "failed": "bg-red-10 text-red-2",
+                  "exited": "bg-red-10 text-red-2"}.get(r["status"], "")
+            t = row_type(r)
+            if t == "star":
+                typ = f"\u2b50 {r.get('trig_time', '')}"
+                what = f"{r['strike']}{r['opt']} \u00b7 BEP {r['price']:g}"
+                closes = f"{r['last_close']:.2f} ({r['last_time']})" if r.get("last_close") is not None else "--"
             else:
-                card_list(name, rows, place, live, empty)
-        om_list(name, "first supports", "star", draw)
+                typ = "BEP cross" if t == "cross" else "Pair"
+                what = CommonWatch.pair_title(r)
+                lc = r["legs"]["CE"].get("last_close"), r["legs"]["PE"].get("last_close")
+                closes = " \u00b7 ".join(f"{v:.2f}" if v is not None else "--" for v in lc)
+            status = CommonWatch.status_text(r) + (f" \u00b7 {notes[r['id']]}" if r["id"] in notes else "")
+            for txt in (typ, what, f"{r['tf']} min" + (" \u00b7 LTP" if r.get("trig_on") == "ltp" else ""),
+                        closes, status):
+                ui.label(txt).classes(f"text-sm px-2 py-1 rounded {bg}")
+            order_type_cell(name, r)
+            sl_tgt_cell(name, r)
+            with ui.row().classes("gap-1 no-wrap"):
+                done = r["order_status"] in ("SENT", "DRY RUN", "sending")
+                opt = r.get("opt") or ""
+                text = f"Ordered {opt} ({r['order_status']})" if done else \
+                    (f"Place order {opt}".strip() if r["status"] == "triggered" else "Place order")
+                b = ui.button(text, on_click=lambda _e, i=r["id"]: place(i)).props("dense size=sm color=green")
+                b.set_enabled(r["status"] == "triggered" and not done)
+                ui.button(icon="delete", on_click=lambda _e, r=r: confirm_delete(name, r)) \
+                    .props("dense flat size=sm color=grey-6")
 
 
 def manual_page():
