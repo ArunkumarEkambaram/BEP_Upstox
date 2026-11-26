@@ -1088,6 +1088,9 @@ def card_ltp_text(name, r) -> str:
     lt = engine.option_ltp
     if r.get("kind") == "pair":
         ce, pe = lt.get((name, r["ce_strike"], "CE")), lt.get((name, r["pe_strike"], "PE"))
+        if r.get("opt"):                             # a leg fired: only that leg (the opponent is hidden)
+            v = ce if r["opt"] == "CE" else pe
+            return f"{r['opt']} {v:.2f}" if v is not None else f"{r['opt']} --"
         return " · ".join(f"{o} {v:.2f}" if v is not None else f"{o} --" for o, v in (("CE", ce), ("PE", pe)))
     v = lt.get((name, int(r["strike"]), r["opt"]))
     if v is None and r.get("last_close") is not None:
@@ -1710,7 +1713,8 @@ def order_card(name, r, place, live):
     with ui.card().classes("w-full gap-2").style(f"border: 1px solid {border}" if border else ""):
         with ui.row().classes("w-full items-center justify-between no-wrap"):
             with ui.row().classes("items-center gap-2"):
-                ui.label(card_symbol(name, r)).classes("text-md font-bold mono")
+                fired = r.get("kind") == "pair" and r.get("opt")   # a Pair leg fired: only that leg is shown
+                ui.label(card_symbol(name, r)).classes("mono font-bold " + ("text-xl" if fired else "text-md"))
                 ui.badge("Buy").props("color=green-9 text-color=green-2")
                 ui.badge("INTRADAY").props("color=grey-8")
                 if r.get("source") != "manual":
@@ -1720,7 +1724,9 @@ def order_card(name, r, place, live):
                 if r.get("source") == "manual":
                     ui.badge("Manual entry").props("color=indigo-7")
                 if r.get("kind") == "pair" and r.get("opt"):
-                    ui.badge(f"{r['opt']} fired · {CommonWatch.pair_title(r)}").props("color=grey-8")
+                    ui.badge(f"{r['opt']} fired").props("color=grey-8") \
+                        .tooltip(f"{CommonWatch.pair_title(r)} \u00b7 the other leg is still watched for the "
+                                 "opponent rule (FAILED before \u26a1, opponent SL after)")
                 if r.get("auto") == "cross":
                     ui.badge(f"BEP cross {r.get('trig_time', '')}").props("color=teal-8") \
                         .tooltip("Added automatically by BEP Support > BEP Pair cross (prices = BEPs, buffer 0)")
@@ -1819,7 +1825,7 @@ def order_card(name, r, place, live):
             elif r.get("auto") == "cross":                 # BEP Pair cross row: each leg's BEP and live LTP - BEP
                 with card_box("BEP"):
                     gap_row = []
-                    for o in ("CE", "PE"):
+                    for o in ((r["opt"],) if r.get("opt") else ("CE", "PE")):
                         with ui.row().classes("items-center gap-2 no-wrap"):
                             ui.label(f"{o} {r[o.lower() + '_price']:.2f}").classes("text-base font-bold whitespace-nowrap")
                             gap_row.append(ui.label("").classes("text-xs font-bold whitespace-nowrap"))
@@ -1828,7 +1834,10 @@ def order_card(name, r, place, live):
                 with card_box(level_name(r)):
                     with ui.row().classes("items-center gap-1 no-wrap"):
                         ui.icon("show_chart").classes("text-sm")
-                        if r.get("kind") == "pair" and r["pe_price"] != r["ce_price"]:
+                        if r.get("kind") == "pair" and r.get("opt") and r["pe_price"] != r["ce_price"]:
+                            ui.label(f"{r['opt']} {r[r['opt'].lower() + '_price']:g}") \
+                                .classes("text-lg font-bold whitespace-nowrap")
+                        elif r.get("kind") == "pair" and r["pe_price"] != r["ce_price"]:
                             ui.label(f"CE {r['ce_price']:g} · PE {r['pe_price']:g}") \
                                 .classes("text-base font-bold whitespace-nowrap")
                         else:
@@ -1859,7 +1868,8 @@ def order_card(name, r, place, live):
         o = engine.row_order(r)
         ltp_lbl.set_text(card_ltp_text(name, r).replace(" · ", "\n"))   # pair: CE and PE on two lines
         if gap_row is not None:
-            for lbl, (opt, gap) in zip(gap_row, cross_bep_gaps(name, r)):
+            gaps = [g for g in cross_bep_gaps(name, r) if not r.get("opt") or g[0] == r["opt"]]
+            for lbl, (opt, gap) in zip(gap_row, gaps):
                 lbl.set_text("--" if gap is None else f"{gap:+.2f} {'above' if gap >= 0 else 'below'}")
                 lbl.classes(remove="text-green-5 text-red-5 opacity-60")
                 lbl.classes(add="opacity-60" if gap is None else ("text-green-5" if gap >= 0 else "text-red-5"))
