@@ -1483,7 +1483,7 @@ def square_off_dialog(order_id):
         return
     retry = str(o.get("sq") or "").startswith("FAILED")
     group = engine.open_on_option(o["index"], o["strike"], o["opt"], exclude_id=o["id"])
-    lots = trade_tracker._f(o.get("qty")) or 1
+    lots = engine.open_lots(o) or trade_tracker._f(o.get("qty")) or 1       # after partial exits: what stays
     units = lots * config.INDEXES.get(o["index"], {}).get("lot_size", 1)
     entry, ltp = trade_tracker._f(o.get("entry")), trade_tracker._f(o.get("ltp_live"))
     pnl = (ltp - entry) * units if entry is not None and ltp is not None else None
@@ -1508,6 +1508,62 @@ def square_off_dialog(order_id):
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Cancel", on_click=dlg.close).props("flat")
             ui.button("Retry square off" if retry else "Square off", icon="logout", on_click=go).props("color=red")
+    dlg.open()
+
+
+def partial_exit_dialog(order_id):
+    """Sell part of an open order's lots now (BEP Upstox): market SELL, the exchange SL is lowered first."""
+    o = next((x for x in engine.order_log if x["id"] == order_id), None)
+    if not o or not engine.partial_exitable(o):
+        ui.notify("Partial exit needs an open order with 2 or more lots and nothing else running.", type="warning")
+        return
+    held = engine.open_lots(o)
+    lot = config.INDEXES.get(o["index"], {}).get("lot_size", 1)
+    entry = (engine._bk(o) or {}).get("fill")
+    if entry is None:
+        entry = trade_tracker._f(o.get("entry"))
+    sym = market_utils.option_symbol(o["index"], o.get("expiry") or engine.monitors[o["index"]].expiry, o["strike"], o["opt"])
+    with ui.context.client.layout, ui.dialog() as dlg, ui.card().style("width: 440px"):
+        ui.label("Partial exit " + sym).classes("text-lg font-bold")
+        lots = ui.number(f"Lots to close (1 to {held - 1}; {held} open)", value=1, min=1, max=held - 1, step=1,
+                         precision=0).classes("w-full")
+        info = ui.label("").classes("text-sm")
+
+        def refresh(_e=None):
+            ltp = engine.option_ltp.get(engine._opt_key(o))
+            if ltp is None:
+                ltp = trade_tracker._f(o.get("ltp_live"))
+            n = int(lots.value or 0)
+            pnl = (ltp - entry) * n * lot if entry is not None and ltp is not None and n else None
+            info.set_text(f"Entry {entry if entry is not None else '--'} · LTP {ltp if ltp is not None else '--'} · "
+                          f"close {n} lot(s), {held - n} stay · approx. P&L of the closed part "
+                          + (f"\u20b9{pnl:,.2f}" if pnl is not None else "--"))
+        lots.on_value_change(refresh)
+        refresh()
+        ui.label("Sends a MARKET SELL for these lots (this order only). The exchange SL's quantity is lowered to "
+                 "what stays FIRST, so it can never sell more than you hold. Target / trail / SL then act on the "
+                 "lots that stay. Not blocked by Pause algo or the daily limit."
+                 + (" Dry run: the paper broker fills it at the LTP." if o.get("status") == "DRY RUN" else "")
+                 ).classes("text-xs opacity-70")
+
+        def go():
+            try:
+                n = int(lots.value)
+            except (TypeError, ValueError):
+                ui.notify("Enter the lots to close.", type="negative")
+                return
+            if not 1 <= n < held:
+                ui.notify(f"Choose 1 to {held - 1} lots (Square off closes all {held}).", type="negative")
+                return
+            why = engine.partial_exit(o["id"], n)
+            if why:
+                ui.notify(f"Partial exit not sent: {why}", type="negative")
+                return
+            dlg.close()
+            ui.notify(f"Partial exit: selling {n} lot(s) of {sym}; {held - n} stay.", type="positive")
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=dlg.close).props("flat")
+            ui.button("Close these lots", icon="content_cut", on_click=go).props("color=deep-orange-8")
     dlg.open()
 
 
@@ -1668,6 +1724,11 @@ def order_card(name, r, place, live):
                     ui.button("Retry square off" if retry else "Square off", icon="logout",
                               on_click=lambda: square_off_dialog(order["id"])) \
                         .props("dense unelevated no-caps color=red-8").tooltip("Exit this position now (market)")
+                    if engine.partial_exitable(order):
+                        ui.button("Partial exit", icon="content_cut",
+                                  on_click=lambda: partial_exit_dialog(order["id"])) \
+                            .props("dense unelevated no-caps color=deep-orange-8") \
+                            .tooltip("Close some of the lots now (market); the rest stays with its SL")
                 m = limit_orders.parse(order.get("mg")) if order is not None else None
                 if order is not None and engine.entry_cancellable(order):
                     ui.button("Retry cancel" if m and m["state"] == "CANCEL FAILED" else "Cancel order",
@@ -1707,14 +1768,20 @@ def order_card(name, r, place, live):
                     entry_price_box(name, r, pending)
             with card_box("Quantity"):
                 if locked:
-                    ui.label(str(trade_tracker._f(order.get("qty")) and int(trade_tracker._f(order.get("qty")))
-                                 if order else engine.row_qty(name, r))).classes("text-lg font-bold")
+                    q_all = int(trade_tracker._f(order.get("qty")) or 0) if order else engine.row_qty(name, r)
+                    st_o = engine._bk(order) if order else None
+                    if st_o and st_o.get("out_qty") and engine.is_open(order):   # after partial exits
+                        ui.label(f"{q_all} → {engine.open_lots(order)}").classes("text-lg font-bold")
+                        ui.label("lots open").classes("text-xs opacity-60")
+                    else:
+                        ui.label(str(q_all)).classes("text-lg font-bold")
                 else:
                     q = ui.number(value=engine.row_qty(name, r), min=1, step=1, precision=0) \
                         .props("dense borderless input-class=text-center").classes("w-16 text-lg font-bold")
                     q.on("blur", lambda _e, q=q: q.value and engine.set_watch_qty(name, r["id"], int(q.value)))
                     q.on("keydown.enter", lambda _e, q=q: q.value and engine.set_watch_qty(name, r["id"], int(q.value)))
-                ui.label("lots").classes("text-xs opacity-60")
+                if not (locked and order and (engine._bk(order) or {}).get("out_qty") and engine.is_open(order)):
+                    ui.label("lots").classes("text-xs opacity-60")
             with card_box("P&L"):
                 pnl_lbl = ui.label("--").classes("text-lg font-bold")
                 pts_lbl = ui.label("").classes("text-xs opacity-70")
@@ -2436,11 +2503,14 @@ def orders_page():
         <q-td key="action" :props="props" style="white-space: nowrap">
             <q-btn v-if="props.row.cx_action" dense unelevated no-caps size="sm" color="orange-9" icon="cancel"
                    :label="props.row.cx_action" @click="() => $parent.$emit('cancellimit', props.row.id)" class="q-mr-xs" />
+            <q-btn v-if="props.row.pe_action" dense unelevated no-caps size="sm" color="deep-orange-8" icon="content_cut"
+                   label="Partial" @click="() => $parent.$emit('partialexit', props.row.id)" class="q-mr-xs" />
             <q-btn v-if="props.row.sq_action" dense unelevated no-caps size="sm" color="red-8" icon="logout"
                    :label="props.row.sq_action" @click="() => $parent.$emit('squareoff', props.row.id)" />
             <span v-else class="text-caption">{{ props.row.sq_text }}</span>
         </q-td>''')
     table.on("squareoff", lambda e: square_off_dialog(e.args))
+    table.on("partialexit", lambda e: partial_exit_dialog(e.args))
     table.on("cancellimit", lambda e: cancel_limit_dialog(e.args))
 
     def render():
@@ -2456,6 +2526,10 @@ def orders_page():
             st = engine._bk(r)
             if st:                                      # broker position: where its SL is now
                 parts.append(positions.summary(st))
+                if st.get("parts"):                     # partial exits (lots @ price)
+                    lot = config.INDEXES.get(r.get("index"), {}).get("lot_size", 1) or 1
+                    parts.append("Partial " + ", ".join(f"{int(x['qty']) // lot} lot @ {x['price']:g}"
+                                                        for x in st["parts"]))
             if engine.trail_text(r):
                 parts.append(engine.trail_text(r))
             r["rules_text"] = " \u00b7 ".join(parts) + (f" \u2192 {r['c_done']}" if r.get("c_done") else "")
@@ -2466,6 +2540,7 @@ def orders_page():
             r["sq_action"] = "Retry square off" if sq.startswith("FAILED") and trade_tracker._f(r.get("exit")) is None \
                 else ("Square off" if engine.is_open(r) else "")
             r["sq_text"] = f"Squared off {sq}" if sq else ""
+            r["pe_action"] = bool(engine.partial_exitable(r))
         for r in engine.order_log:                    # open positions: (LTP - Entry) x qty, worked out locally
             live = engine.open_pnl(r)
             r["open_points"], r["open_pnl"] = (live if live else (None, None))

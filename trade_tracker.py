@@ -30,6 +30,7 @@ from datetime import datetime, time as dtime, timedelta
 import config
 import exit_rules
 import limit_orders
+import positions
 import market_utils
 
 
@@ -144,7 +145,7 @@ def compute(client, rows, expiry_by_index, trades=None, now=None, known=None):
 
         b = _bk(r)
         if b:                                         # broker position (positions.py): Entry / Exit come from it
-            entry, exit_ = _f(b.get("fill")), _f(b.get("exit"))
+            entry, exit_ = _f(b.get("fill")), _f(positions.avg_exit(b))   # avg over partial exits + the final one
             qty_units = _f(b.get("fill_qty")) or _f(b.get("units"))
             rules = [x for x in custom_rules(r) if x.get("type") == "CANDLE"]   # LTP / POINT: the position does it
             if rules and exit_ is None and entry is not None and not r.get("c_done") and ik \
@@ -156,6 +157,8 @@ def compute(client, rows, expiry_by_index, trades=None, now=None, known=None):
                     fields["custom_hit"] = hit
             fields["filled_qty"] = int(b["fill_qty"]) if b.get("fill_qty") else ""
             fields.update(_points(entry, exit_, ltp, qty_units))
+            if b.get("parts") and b.get("exit") is not None and entry is not None:   # exact, not via the avg price
+                fields["pnl"] = round(positions.parts_pnl(b) + (float(b["exit"]) - entry) * positions.held(b), 2)
             out[r["id"]] = fields
             continue
         m = limit_orders.parse(r.get("mg"))
