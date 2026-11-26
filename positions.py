@@ -15,6 +15,10 @@ calls PositionManager.tick, which reads the broker's order book once and moves e
   exit   target (LTP / POINT on the live LTP), a CANDLE rule (engine), the Pair opponent, a manual square-off or
          15:15: the SL order is MODIFIED to MARKET (one sell order, no double sell / short). No SL order: a
          MARKET SELL. The SL order filling on its own = exit "SL" / "Trailing SL".
+  partial  "Partial exit" (user, 26 Nov): sell X of the open units at MARKET. The exchange SL's quantity is
+         lowered to what stays FIRST (so it can never sell more than is held), then the SELL goes out. Each
+         filled part is kept in st["parts"]; held() = filled - sold in parts. Target / trail / SL / the final exit
+         then act on held() only.
 
 Brokers without an order book or status call (the Upstox sandbox) are "assumed": the entry counts as filled at
 the LTP when sent, an exit as filled at the LTP once its modify / sell was accepted, and the SL as hit when the
@@ -44,7 +48,31 @@ def new_state(mode: str, tag: str, ik: str, units: int, plan: dict, ref_price, k
             "sl_id": "", "sl_st": "", "sl_trg": None, "sl_first": None, "sl_kind": bk.SLM, "sl_tries": 0,
             "sl_reset": False, "high": None, "trail_at": 0.0,
             "exit_req": "", "exit_req_time": "", "exit_id": "", "exit_how": "", "exit_tries": 0,
-            "exit": None, "exit_time": "", "exit_reason": "", "closed": "", "alert": ""}
+            "exit": None, "exit_time": "", "exit_reason": "", "closed": "", "alert": "",
+            "parts": [], "out_qty": 0, "part_req": None, "part_id": "", "part_tries": 0}
+
+
+def held(st) -> int:
+    """Units still held: filled minus the units sold by partial exits."""
+    if not st:
+        return 0
+    return max(0, int(st.get("fill_qty") or 0) - int(st.get("out_qty") or 0))
+
+
+def parts_pnl(st) -> float:
+    """Realized P&L of the partial exits (price - fill) x units."""
+    fill = (st or {}).get("fill")
+    if fill is None:
+        return 0.0
+    return round(sum((float(p["price"]) - fill) * int(p["qty"]) for p in st.get("parts") or []), 2)
+
+
+def avg_exit(st):
+    """Average exit price over the whole filled quantity (parts + the final exit); None until closed."""
+    if not st or st.get("exit") is None or not st.get("fill_qty"):
+        return None if not st else st.get("exit")
+    sold = sum(float(p["price"]) * int(p["qty"]) for p in st.get("parts") or [])
+    return round((sold + float(st["exit"]) * held(st)) / int(st["fill_qty"]), 2)
 
 
 def sl_trigger(plan: dict, fill):
@@ -111,6 +139,8 @@ def summary(st) -> str:
         return "entry " + (st.get("entry_st") or "sending").lower().replace("_", " ")
     if st.get("exit_req"):
         return f"exiting · {st['exit_req']}"
+    if st.get("part_req"):
+        return f"partial exit · selling {st['part_req']['qty']}"
     if st.get("alert"):
         return st["alert"]
     if st.get("sl_id") and st.get("sl_trg") is not None:
@@ -145,6 +175,23 @@ class PositionManager:
             return False
         st["exit_req"], st["exit_req_time"] = reason, now_text
         return True
+
+    @staticmethod
+    def request_partial(st: dict, units: int, now_text: str) -> str:
+        """Asks to sell `units` of the open position now (next tick). Returns "" or why it can't."""
+        units = int(units or 0)
+        if not is_open(st):
+            return "the position is not open"
+        if st.get("exit_req"):
+            return f"an exit is already running ({st['exit_req']})"
+        if st.get("part_req") or st.get("part_id"):
+            return "a partial exit is already running"
+        if entry_open(st):
+            return "the entry is still (partly) open at the exchange - cancel the rest first"
+        if units <= 0 or units >= held(st):
+            return f"choose fewer units than are held ({held(st)}); use Square off to close all"
+        st.update(part_req={"qty": units, "time": now_text}, part_tries=0)
+        return ""
 
     @staticmethod
     def request_cancel(st: dict, reason: str) -> bool:
@@ -336,6 +383,12 @@ class PositionManager:
                 self._closed(st, ltp, "Trailing SL" if moved else "SL", now_text, events, key)
                 return
 
+        # 3b -- partial exit: wait for its SELL, or send it (SL quantity lowered first)
+        if self._partial(key, st, ltp, book, now_text, events):
+            return
+        if not held(st):
+            return
+
         plan = st.get("plan") or {}
         # 4 -- exits decided by the app
         if not st.get("exit_req"):
@@ -365,13 +418,13 @@ class PositionManager:
         lvl = trail_level(plan.get("trail"), fill, st.get("high"))
         if lvl is not None and (want is None or lvl > want):
             want = lvl
-        if st.get("sl_id") and st.get("sl_qty") and st["sl_qty"] != st["fill_qty"]:
+        if st.get("sl_id") and st.get("sl_qty") and st["sl_qty"] != held(st):
             res = self.broker.modify(st["sl_id"], order_type=st.get("sl_kind"), trigger_price=st["sl_trg"],
                                      price=bk.round_tick(st["sl_trg"] - self.gap) if st.get("sl_kind") == bk.SL else None,
-                                     quantity=st["fill_qty"])
+                                     quantity=held(st))
             if res.ok:
-                self._ev(events, key, "log", text=f"exchange SL quantity {st['sl_qty']} -> {st['fill_qty']} (more filled)")
-                st["sl_qty"] = st["fill_qty"]
+                self._ev(events, key, "log", text=f"exchange SL quantity {st['sl_qty']} -> {held(st)}")
+                st["sl_qty"] = held(st)
             else:
                 self._ev(events, key, "log", text=f"SL quantity modify FAILED: {res.message}")
         if st.get("sl_trg") is not None and not st.get("sl_reset") and want is not None:
@@ -403,12 +456,12 @@ class PositionManager:
         limit = bk.round_tick(trigger - self.gap) if kind == bk.SL else 0.0
         if kind == bk.SL and limit <= 0:
             limit = bk.TICK
-        req = bk.OrderRequest(self._ik(st), bk.SELL, int(st["fill_qty"] or st["units"]), kind,
+        req = bk.OrderRequest(self._ik(st), bk.SELL, int(held(st) or st["units"]), kind,
                               price=limit, trigger_price=trigger, tag=st["tag"], ref_price=None)
         res = self.broker.place(req)
         if res.ok:
             st.update(sl_id=res.order_id, sl_st=bk.SENT, sl_trg=trigger, sl_reset=False, alert="",
-                      sl_qty=int(st["fill_qty"] or st["units"]))
+                      sl_qty=int(held(st) or st["units"]))
             if st.get("sl_first") is None:
                 st["sl_first"] = trigger
             self._ev(events, key, "sl", text=f"exchange SL placed: {kind} trigger {trigger:.2f}"
@@ -433,7 +486,7 @@ class PositionManager:
             return
         if st.get("sl_id") and st.get("sl_st") not in bk.FINAL:
             res = self.broker.modify(st["sl_id"], order_type=bk.MARKET,
-                                     quantity=st["fill_qty"] if st.get("sl_qty") != st["fill_qty"] else None)
+                                     quantity=held(st) if st.get("sl_qty") != held(st) else None)
             if res.ok:
                 st.update(exit_id=st["sl_id"], exit_how="modify")
                 self._ev(events, key, "log", text=f"exit ({st['exit_req']}): exchange SL changed to MARKET")
@@ -444,7 +497,7 @@ class PositionManager:
             if not c.ok:
                 return                                    # keep the SL; try again next tick
             st.update(sl_id="", sl_st="")
-        req = bk.OrderRequest(self._ik(st), bk.SELL, int(st["fill_qty"] or st["units"]), bk.MARKET,
+        req = bk.OrderRequest(self._ik(st), bk.SELL, int(held(st) or st["units"]), bk.MARKET,
                               tag=st["tag"], ref_price=None)
         res = self.broker.place(req)
         if res.ok:
@@ -454,6 +507,65 @@ class PositionManager:
             st["exit_tries"] += 1
             self._ev(events, key, "log", text=f"exit SELL FAILED: {res.message}"
                      + (" (check the Upstox order book)" if res.uncertain else ""))
+
+    def _partial(self, key, st, ltp, book, now_text, events) -> bool:
+        """Partial exit. True = stop this tick here (waiting for the partial SELL)."""
+        if st.get("part_id"):
+            s, lost = self._look(book, st["part_id"])
+            q = int((st.get("part_req") or {}).get("qty") or 0)
+            done_price = None
+            if s and s.status == bk.COMPLETE:
+                done_price = s.avg_price
+            elif s and s.status in (bk.REJECTED, bk.CANCELLED):
+                self._ev(events, key, "alert", text=f"partial exit SELL {s.status.lower()}: {s.message} "
+                         "- nothing was sold; the exchange SL is set back to the full quantity")
+                st.update(part_id="", part_req=None)      # step 5 puts the SL quantity back to held()
+                return False
+            elif self.assumed or lost:
+                done_price = ltp if ltp is not None else st["fill"]
+            else:
+                return True                               # still working at the exchange
+            st["parts"] = (st.get("parts") or []) + [{"qty": q, "price": round(float(done_price), 2),
+                                                      "time": now_text}]
+            st["out_qty"] = int(st.get("out_qty") or 0) + q
+            st.update(part_id="", part_req=None)
+            self._ev(events, key, "partial", qty=q, price=round(float(done_price), 2), left=held(st), time=now_text)
+            return False
+        req = st.get("part_req")
+        if not req or st.get("exit_req"):
+            if req and st.get("exit_req"):
+                st["part_req"] = None                     # a full exit came first: it closes everything held
+            return False
+        q, left = int(req["qty"]), held(st) - int(req["qty"])
+        if left <= 0:
+            st["part_req"] = None
+            return False
+        if st.get("part_tries", 0) >= EXIT_TRIES:
+            st["part_req"] = None
+            self._ev(events, key, "alert", text=f"partial exit not sent after {EXIT_TRIES} tries - nothing sold")
+            return False
+        if st.get("sl_id") and st.get("sl_st") not in bk.FINAL and st.get("sl_qty") != left:
+            res = self.broker.modify(st["sl_id"], order_type=st.get("sl_kind"), trigger_price=st["sl_trg"],
+                                     price=bk.round_tick(st["sl_trg"] - self.gap) if st.get("sl_kind") == bk.SL else None,
+                                     quantity=left)
+            if not res.ok:
+                st["part_tries"] = st.get("part_tries", 0) + 1
+                self._ev(events, key, "log", text=f"partial exit: SL quantity modify FAILED ({res.message}) - "
+                         "the SELL is not sent until the SL is lowered")
+                return True
+            st["sl_qty"] = left
+            self._ev(events, key, "log", text=f"partial exit: exchange SL quantity lowered to {left}")
+        res = self.broker.place(bk.OrderRequest(self._ik(st), bk.SELL, q, bk.MARKET, tag=st["tag"], ref_price=None))
+        if res.ok:
+            st["part_id"] = res.order_id
+            self._ev(events, key, "log", text=f"partial exit: market SELL {q} sent ({res.order_id}); {left} stay")
+            if self.assumed:
+                return self._partial(key, st, ltp, book, now_text, events) or True
+            return True
+        st["part_tries"] = st.get("part_tries", 0) + 1
+        self._ev(events, key, "log", text=f"partial exit SELL FAILED: {res.message}"
+                 + (" (check the Upstox order book)" if res.uncertain else ""))
+        return True
 
     @staticmethod
     def _ik(st):

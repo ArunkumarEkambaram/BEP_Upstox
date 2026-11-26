@@ -252,6 +252,9 @@ class Engine:
         units = trade_tracker._f(o.get("filled_qty")) or \
             (trade_tracker._f(o.get("qty")) or 1) * config.INDEXES.get(o.get("index"), {}).get("lot_size", 1)
         pts = round(ltp - entry, 2)
+        st = self._bk(o)
+        if st and st.get("out_qty"):                  # partial exits: open part on what is held + the realized part
+            return pts, round(pts * positions.held(st) + positions.parts_pnl(st), 2)
         return pts, round(pts * units, 2)
 
     def pnl_summary(self) -> dict:
@@ -1454,6 +1457,45 @@ class Engine:
             self.bump("orders", "watch")
         return ok
 
+    def open_lots(self, o) -> int:
+        """Lots still held by a broker position (after partial exits); 0 if none / closed."""
+        st = self._bk(o)
+        if not st or not positions.is_open(st):
+            return 0
+        return positions.held(st) // int(config.INDEXES.get(o.get("index"), {}).get("lot_size", 1) or 1)
+
+    def partial_exitable(self, o) -> bool:
+        """The order can sell part of its lots now: open broker position in this mode, 2+ lots held, nothing
+        else running."""
+        st = self._bk(o)
+        return bool(st) and st.get("mode") == config.BROKER_MODE and self.open_lots(o) >= 2 \
+            and not st.get("exit_req") and not st.get("part_req") and not positions.entry_open(st) \
+            and not self.squared_off(o)
+
+    def partial_exit(self, order_id, lots) -> str:
+        """Sells `lots` of an open order now (market); the exchange SL is lowered to what stays first.
+        Not blocked by Pause algo / the daily limit (an exit). Returns "" or why not."""
+        o = next((x for x in self.order_log if x["id"] == order_id), None)
+        st = self._bk(o)
+        if not o or not st:
+            return "not a broker order"
+        if st.get("mode") != config.BROKER_MODE:
+            return f"this order was placed in {st.get('mode', '?').upper()} mode - switch back to it first"
+        lot = int(config.INDEXES.get(o["index"], {}).get("lot_size", 1) or 1)
+        held = self.open_lots(o)
+        if not 1 <= int(lots) < held:
+            return f"choose 1 to {held - 1} lot(s) ({held} open); Square off closes all"
+        why = positions.PositionManager.request_partial(st, int(lots) * lot, _stamp())
+        if why:
+            return why
+        left = self.open_lots(o) - int(lots)
+        o["detail"] = f"{o.get('detail', '')} | Partial exit requested: {int(lots)} lot(s) {_stamp()}".strip(" |")
+        self.log(f"{o['index']} {o['strike']}{o['opt']} #{o['id']}: partial exit {int(lots)} lot(s) requested; "
+                 f"{left} lot(s) stay (the exchange SL is lowered first).")
+        self._rewrite_orders_file()
+        self.bump("orders", "watch")
+        return ""
+
     def entry_open(self, o) -> bool:
         """The order's Limit / Stop-limit entry still waits (or is partly filled) at the exchange."""
         st = self._bk(o)
@@ -1508,6 +1550,16 @@ class Engine:
                 self.log(f"{what}: entry filled {ev['qty']} @ {ev['price']:.2f}.")
             elif kind == "sl":
                 self.log(f"{what}: {ev['text']}.")
+            elif kind == "partial":
+                lot = int(config.INDEXES.get(o["index"], {}).get("lot_size", 1) or 1)
+                fill = (self._bk(o) or {}).get("fill")
+                pnl = round((ev["price"] - fill) * ev["qty"], 2) if fill is not None else None
+                o["detail"] = (f"{o.get('detail', '')} | Partial exit {ev['qty'] // lot} lot(s) @ {ev['price']} "
+                               f"{ev['time']}" + (f", P&L {pnl}" if pnl is not None else "")).strip(" |")
+                self.log(f"{what}: PARTIAL EXIT {ev['qty']} @ {ev['price']}" + (f" (P&L {pnl})" if pnl is not None else "")
+                         + f"; {ev['left']} units ({ev['left'] // lot} lot(s)) stay.")
+                self.notify(f"{o['index']} {o['strike']}{o['opt']}: partial exit {ev['qty'] // lot} lot(s) @ {ev['price']}"
+                            f" - {ev['left'] // lot} lot(s) stay", "info", f"{o['index']} partial exit")
             elif kind == "exit":
                 o.update(exit=ev["price"], exit_time=ev["time"][:5], exit_reason=ev["reason"])
                 o["detail"] = f"{o.get('detail', '')} | Exit: {ev['reason']} {ev['time']} @ {ev['price']}".strip(" |")
