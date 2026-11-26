@@ -33,6 +33,7 @@ from brokers import base as bk
 
 SL_TRIES = 3              # attempts to place the exchange SL after a fill, then "NO SL"
 EXIT_TRIES = 3            # attempts to get an exit order accepted, then an alert
+SL_MOD_ALERT = "SL MODIFY FAILED"   # chip / alert when the exchange keeps refusing an SL modify (user, 26 Nov)
 MODIFY_EVERY = 2.0        # seconds between two trailing modifies of one SL order
 
 
@@ -49,7 +50,7 @@ def new_state(mode: str, tag: str, ik: str, units: int, plan: dict, ref_price, k
             "sl_reset": False, "high": None, "trail_at": 0.0,
             "exit_req": "", "exit_req_time": "", "exit_id": "", "exit_how": "", "exit_tries": 0,
             "exit": None, "exit_time": "", "exit_reason": "", "closed": "", "alert": "",
-            "parts": [], "out_qty": 0, "part_req": None, "part_id": "", "part_tries": 0}
+            "parts": [], "out_qty": 0, "part_req": None, "part_id": "", "part_tries": 0, "sl_mod_fails": 0}
 
 
 def held(st) -> int:
@@ -402,10 +403,14 @@ class PositionManager:
                     reason = "Target"
                 elif lvl is not None and ltp is not None and ltp <= lvl and (st.get("sl_trg") or 0) < lvl - 1e-9:
                     reason = "Trailing SL"                    # the exchange SL is lower / missing: exit now
-                elif not st.get("sl_id"):
+                else:
                     trg = sl_trigger(plan, fill)
-                    if trg is not None and ltp is not None and ltp <= trg:
-                        reason = "SL"                         # already through the SL: no point placing it
+                    if (trg is not None and ltp is not None and ltp <= trg
+                            and (not st.get("sl_id") or (st.get("sl_trg") or 0) < trg - 1e-9)):
+                        # already through the SL: no exchange SL yet, or the SL was raised to / above the LTP
+                        # (user, 26 Nov): a SELL stop with its trigger above the LTP is refused by the exchange,
+                        # so exit now instead of moving it
+                        reason = "SL"
             if reason:
                 self.request_exit(st, reason, now_text)
 
@@ -425,8 +430,10 @@ class PositionManager:
             if res.ok:
                 self._ev(events, key, "log", text=f"exchange SL quantity {st['sl_qty']} -> {held(st)}")
                 st["sl_qty"] = held(st)
+                self._mod_ok(st)
             else:
                 self._ev(events, key, "log", text=f"SL quantity modify FAILED: {res.message}")
+                self._mod_failed(key, st, res.message, events)
         if st.get("sl_trg") is not None and not st.get("sl_reset") and want is not None:
             want = max(want, st["sl_trg"])                    # never down (except a user change)
         if want is None:
@@ -448,8 +455,24 @@ class PositionManager:
                 old = st.get("sl_trg")
                 st["sl_trg"], st["sl_reset"] = want, False
                 self._ev(events, key, "log", text=f"exchange SL moved {old} -> {want:.2f}")
+                self._mod_ok(st)
             else:
                 self._ev(events, key, "log", text=f"SL modify FAILED: {res.message}")
+                self._mod_failed(key, st, res.message, events)
+
+    def _mod_failed(self, key, st, message, events):
+        """The exchange refused an SL modify: after SL_TRIES in a row an alert (once) instead of silent retries."""
+        st["sl_mod_fails"] = int(st.get("sl_mod_fails") or 0) + 1
+        if st["sl_mod_fails"] >= SL_TRIES and st.get("alert") != SL_MOD_ALERT:
+            st["alert"] = SL_MOD_ALERT
+            self._ev(events, key, "alert", text=f"exchange SL modify refused {st['sl_mod_fails']} times ({message}): "
+                     f"check the SL; it stays at {st.get('sl_trg')}")
+
+    @staticmethod
+    def _mod_ok(st):
+        st["sl_mod_fails"] = 0
+        if st.get("alert") == SL_MOD_ALERT:
+            st["alert"] = ""
 
     def _place_sl(self, key, st, trigger, events):
         kind = st.get("sl_kind") or bk.SLM
