@@ -2216,8 +2216,8 @@ def pair_page():
     om_header("Pair (CE vs PE)", "Entry: a leg closes above its price while the opponent closes below price − "
               "buffer (the leg must have been at or below its price first). After you order, the opponent closing "
               "back at or above that line squares off the position (live) or records the exit (dry run). "
-              "Auto at 09:15 (switch): 09:15-09:20 the first leg whose live LTP crosses above its price is ORDERED "
-              "BY ITSELF (no opponent check); after 09:20 with no cross the row is a normal Pair.")
+              f"Auto at 09:15 (switch): {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg whose live LTP crosses above its price is ORDERED "
+              f"BY ITSELF (no opponent check); after {config.PAIR_AUTO_TO[:5]} with no cross the row is a normal Pair.")
     for name in engine.active():
         step = config.INDEXES[name]["strike_interval"]
         with ui.card().classes("w-full"):
