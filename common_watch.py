@@ -216,7 +216,7 @@ class CommonWatch:
         return changed
 
     def add_pair(self, ce_strike: int, pe_strike: int, ce_price: float, pe_price: float, buffer: float, tf: int,
-                 now=None, mode: str = None, trig_on: str = "close", auto_open: bool = False) -> dict:
+                 now=None, mode: str = None, trig_on: str = "close", auto_open: bool = False, tf_sec=None) -> dict:
         now = now or datetime.now(IST)
         self._roll_day(now)
         self._seq += 1
@@ -230,7 +230,9 @@ class CommonWatch:
                "last_close": None, "last_time": "", "fail_time": "", "fail_close": None,
                "opp_close": None, "exit_close": None, "order_status": "", "order_id": None, "squareoff": "",
                "trig_on": "ltp" if trig_on == "ltp" else "close",
-               "auto_open": bool(auto_open)}         # "Auto at 09:15": placed by itself on the first cross above
+               "auto_open": bool(auto_open)}         # "Auto order": placed by itself (window rule, then Pair rule)
+        if tf_sec in (15, 30):                    # 15 s / 30 s: app-built candles in the auto window, 1 min after
+            row.update(tf=1, tf_sec=int(tf_sec))
         self._apply_mode(row, mode)
         self.rows.append(row)
         self.save()
@@ -246,6 +248,71 @@ class CommonWatch:
     def auto_active(r, now) -> bool:
         return bool(r.get("auto_open")) and r.get("kind") == "pair" and r.get("auto") != "cross" \
             and r["status"] == "watching" and CommonWatch.auto_window(now)
+
+    @staticmethod
+    def tf_label(r) -> str:
+        """"15 s" / "30 s" (app-built candles in the auto window) or "5 min"."""
+        return f"{r['tf_sec']} s" if r.get("tf_sec") else f"{r['tf']} min"
+
+    @staticmethod
+    def _hms(now, hms):
+        h, m, sec = (int(x) for x in hms.split(":"))
+        return now.astimezone(IST).replace(hour=h, minute=m, second=sec, microsecond=0)
+
+    @staticmethod
+    def auto_why(r) -> str:
+        """Why an auto Pair order was placed (Log / entry note)."""
+        if r.get("auto_fire"):
+            return (f"Pair rule: {r['opt']} {'LTP' if r.get('trig_how') == 'ltp' else 'close'} {r['trig_close']:.2f} "
+                    f"above {r['price']:g}, opponent below")
+        if r.get("auto_how") == "close":
+            return f"{r.get('auto_tf') or CommonWatch.tf_label(r)} candle closed {r['trig_close']:.2f} above {r['price']:g}"
+        return f"LTP {r['trig_close']:.2f} crossed above {r['price']:g}"
+
+    def _sec_candles(self, r, lt, price, now, label) -> tuple:
+        """15 s / 30 s candles built from the live LTP (Upstox has none) for an "Auto order" Pair row on Candle
+        close, 09:15-09:30. A candle closes at its end: close = the last LTP read inside it. A leg that was at or
+        below its price from 09:15 and whose candle closes above it is ordered (no opponent check; both = the one
+        more above). A candle the app did not see from its start (start / restart mid-candle) is skipped.
+        Returns (fired copy or None, changed)."""
+        tf = int(r["tf_sec"])
+        t0, end = self._hms(now, config.PAIR_AUTO_FROM), self._hms(now, config.PAIR_AUTO_TO)
+        if now < t0 or now >= end + timedelta(seconds=tf + 10):
+            return None, False
+        idx = int((now - t0).total_seconds() // tf)
+        sc, fired, changed = r.get("sc"), None, False
+        full_next = None
+        if sc and sc.get("i") != idx:                  # the stored candle has closed
+            c_end = t0 + timedelta(seconds=(sc["i"] + 1) * tf)
+            if sc.get("full") and c_end <= end and r["status"] == "watching" \
+                    and (now - c_end).total_seconds() <= 10:
+                closes = sc.get("c") or {}
+                cands = [(closes[o] - price[o], o) for o in ("CE", "PE")
+                         if r["legs"][o].get("auto_below") and closes.get(o) is not None and closes[o] > price[o]]
+                if cands:
+                    o = max(cands)[1]
+                    opp = "PE" if o == "CE" else "CE"
+                    strike = r["ce_strike"] if o == "CE" else r["pe_strike"]
+                    t = c_end.strftime("%H:%M:%S")
+                    r.update(status="triggered", opt=o, strike=strike, price=price[o], trig_time=t,
+                             trig_close=closes[o], last_close=closes[o], last_time=t, trig_how="auto",
+                             auto_how="close", auto_tf=self.tf_label(r), trig_opp=closes.get(opp))
+                    fired = dict(r)
+            full_next = idx == sc["i"] + 1
+            sc, changed = None, True
+        if sc is None:
+            start = t0 + timedelta(seconds=idx * tf)
+            sc = {"i": idx, "c": {}, "full": full_next if full_next is not None
+                  else (now - start).total_seconds() <= 3}
+            r["sc"] = sc
+            changed = True
+        for o in ("CE", "PE"):
+            if lt[o] is not None:
+                sc["c"][o] = lt[o]
+                if now < end and lt[o] <= price[o] and not r["legs"][o].get("auto_below"):
+                    r["legs"][o]["auto_below"] = True
+                    changed = True
+        return fired, changed
 
     def set_auto(self, row_id: int, on: bool) -> bool:
         """Turns "Auto at 09:15" on / off for a Pair row (not a BEP cross row) while it is still watching."""
@@ -320,7 +387,7 @@ class CommonWatch:
         return True
 
     def edit(self, row_id: int, tf: int, price: float = None, pe_price: float = None, buffer: float = None,
-             trig_on: str = None) -> bool:
+             trig_on: str = None, tf_sec=None) -> bool:
         """Changes a WAITING row's level / timeframe (pair: CE price, PE price, buffer) and restarts its check from
         the candles before it was added (same baseline rule as a new row). Not for \u2b50 rows."""
         r = self.get(row_id)
@@ -334,6 +401,11 @@ class CommonWatch:
         if trig_on in ("close", "ltp"):
             r["trig_on"] = trig_on
         if r.get("kind") == "pair":
+            r.pop("sc", None)
+            if tf_sec in (15, 30):
+                r.update(tf=1, tf_sec=int(tf_sec))
+            else:
+                r.pop("tf_sec", None)
             r.update(ce_price=float(price), pe_price=float(pe_price if pe_price is not None else price),
                      buffer=float(buffer if buffer is not None else r["buffer"]))
             r["legs"] = {o: {"prev_close": None, "last_close": None, "last_done": None} for o in ("CE", "PE")}
@@ -442,6 +514,7 @@ class CommonWatch:
         price = {"CE": r["ce_price"], "PE": r["pe_price"]}
         line = {o: price[o] - r["buffer"] for o in ("CE", "PE")}      # the opponent must stay BELOW this
         changed, fired = False, []
+        auto_row = bool(r.get("auto_open")) and r.get("auto") != "cross"
         if r["baseline"] is None:
             before = [t for t in times if datetime.fromisoformat(t) + tf <= added_at]
             base = before[-1] if before else None
@@ -454,7 +527,24 @@ class CommonWatch:
             if done and datetime.fromisoformat(t) <= datetime.fromisoformat(done):
                 continue
             label = (datetime.fromisoformat(t).astimezone(IST) + tf).strftime("%H:%M")
-            if r["status"] == "watching":
+            c_start = datetime.fromisoformat(t).astimezone(IST)
+            in_window = auto_row and self._hms(c_start, config.PAIR_AUTO_FROM) <= c_start \
+                and c_start + tf <= self._hms(c_start, config.PAIR_AUTO_TO)
+            if r["status"] == "watching" and in_window and not r.get("tf_sec") and r.get("trig_on") != "ltp":
+                for o in ("CE", "PE"):                # "Auto order" on Candle close, 09:15-09:30 (1 / 3 / 5 min)
+                    if closes[o][t] <= price[o] or (c_start >= added_at and lows[o].get(t, closes[o][t]) <= price[o]):
+                        r["legs"][o]["auto_below"] = True
+                cands = [(closes[o][t] - price[o], o) for o in ("CE", "PE")
+                         if r["legs"][o].get("auto_below") and closes[o][t] > price[o]]
+                if cands:
+                    o = max(cands)[1]
+                    opp = "PE" if o == "CE" else "CE"
+                    strike = r["ce_strike"] if o == "CE" else r["pe_strike"]
+                    r.update(status="triggered", opt=o, strike=strike, price=price[o], trig_time=label,
+                             trig_close=closes[o][t], last_close=closes[o][t], last_time=label, trig_how="auto",
+                             auto_how="close", auto_tf=self.tf_label(r), trig_opp=closes[opp][t])
+                    fired.append(dict(r))
+            elif r["status"] == "watching" and not in_window:
                 for o, opp in (("CE", "PE"), ("PE", "CE")):
                     prev, close = r["legs"][o]["prev_close"], closes[o][t]
                     if prev is None:              # no candle before the row (added pre-open): use this candle's open
@@ -467,7 +557,7 @@ class CommonWatch:
                             and not self.auto_active(r, now):
                         strike = r["ce_strike"] if o == "CE" else r["pe_strike"]
                         r.update(status="triggered", opt=o, strike=strike, price=price[o], trig_time=label,
-                                 trig_close=close, last_close=close, last_time=label)
+                                 trig_close=close, last_close=close, last_time=label, auto_fire=auto_row)
                         fired.append(dict(r))
                         break
             elif r["status"] == "triggered":
@@ -503,11 +593,19 @@ class CommonWatch:
                     if lt[o] is not None and lt[o] <= price[o] and not r["legs"][o].get("armed"):
                         r["legs"][o]["armed"] = True
                         changed = True
-                if self.auto_active(r, now):           # "Auto at 09:15": the first leg to CROSS above its price
-                    for o in ("CE", "PE"):             # (at or below it at some point from 09:15, then above)
+                if r.get("auto_open") and r.get("auto") != "cross" and r.get("tf_sec") and r.get("trig_on") != "ltp":
+                    f, ch = self._sec_candles(r, lt, price, now, label)   # 15 s / 30 s candle close, 09:15-09:30
+                    changed = changed or ch
+                    if f:
+                        fired.append(f)
+                        continue
+                if self.auto_active(r, now):           # "Auto order", 09:15-09:30: Live LTP = the first leg to
+                    for o in ("CE", "PE"):             # CROSS above its price (at or below it first, from 09:15);
                         if lt[o] is not None and lt[o] <= price[o] and not r["legs"][o].get("auto_below"):
-                            r["legs"][o]["auto_below"] = True
+                            r["legs"][o]["auto_below"] = True   # Candle close = the candle rule (step / _sec_candles)
                             changed = True
+                    if r.get("trig_on") != "ltp":
+                        continue
                     cands = [(lt[o] - price[o], o) for o in ("CE", "PE")
                              if r["legs"][o].get("auto_below") and lt[o] is not None and lt[o] > price[o]]
                     if cands:                          # both in the same check: the one more points above
@@ -516,7 +614,7 @@ class CommonWatch:
                         strike = r["ce_strike"] if o == "CE" else r["pe_strike"]
                         r.update(status="triggered", opt=o, strike=strike, price=price[o], trig_time=label,
                                  trig_close=lt[o], last_close=lt[o], last_time=label, trig_how="auto",
-                                 trig_opp=lt[opp])
+                                 auto_how="ltp", trig_opp=lt[opp])
                         fired.append(dict(r))
                         changed = True
                     continue                           # no normal trigger while the auto window is on
@@ -526,7 +624,8 @@ class CommonWatch:
                     if r["legs"][o].get("armed") and lt[o] > price[o] and lt[opp] < price[opp] - r["buffer"]:
                         strike = r["ce_strike"] if o == "CE" else r["pe_strike"]
                         r.update(status="triggered", opt=o, strike=strike, price=price[o], trig_time=label,
-                                 trig_close=lt[o], last_close=lt[o], last_time=label, trig_how="ltp", trig_opp=lt[opp])
+                                 trig_close=lt[o], last_close=lt[o], last_time=label, trig_how="ltp", trig_opp=lt[opp],
+                                 auto_fire=bool(r.get("auto_open")) and r.get("auto") != "cross")
                         fired.append(dict(r))
                         changed = True
                         break
@@ -580,17 +679,25 @@ class CommonWatch:
                     t = now.strftime("%H:%M:%S")
                     if t < config.PAIR_AUTO_TO:
                         legs = [o for o in ("CE", "PE") if r["legs"][o].get("auto_below")]
+                        how = ("live LTP crosses above its price" if r.get("trig_on") == "ltp" else
+                               f"{CommonWatch.tf_label(r)} candle closes above its price")
                         return (f"AUTO {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}: the first leg whose "
-                                "live LTP crosses above its price is ordered \u00b7 "
+                                f"{how} is ordered \u00b7 "
                                 + ((" + ".join(legs) + " at or below its price") if legs else
                                    "no leg at or below its price yet"))
-                    return (f"Auto ended at {config.PAIR_AUTO_TO[:5]} (no cross) \u00b7 normal Pair: "
-                            "watching both legs \u00b7 " + CommonWatch.armed_text(r))
+                    return (f"Auto order ON: the Pair rule places the order by itself (until 15:15)"
+                            + (f"; {CommonWatch.tf_label(r)} \u2192 1 min candles after {config.PAIR_AUTO_TO[:5]}"
+                               if r.get("tf_sec") else "")
+                            + " \u00b7 watching both legs \u00b7 " + CommonWatch.armed_text(r))
                 return "Watching both legs \u00b7 " + CommonWatch.armed_text(r)
-            text = (f"AUTO: {r['opt']} LTP crossed above {r['price']:g} at {r['trig_time']}, LTP {r['trig_close']:.2f}"
+            text = (f"AUTO: {r['opt']} {r.get('auto_tf') or ''} candle closed above {r['price']:g} at {r['trig_time']}, "
+                    f"close {r['trig_close']:.2f}" if r.get("trig_how") == "auto" and r.get("auto_how") == "close" else
+                    f"AUTO: {r['opt']} LTP crossed above {r['price']:g} at {r['trig_time']}, LTP {r['trig_close']:.2f}"
                     if r.get("trig_how") == "auto" else
                     f"{r['opt']} LTP above at {r['trig_time']}, LTP {r['trig_close']:.2f}" if r.get("trig_how") == "ltp"
                     else f"{r['opt']} closed above at {r['trig_time']}, close {r['trig_close']:.2f}")
+            if r.get("auto_fire"):
+                text = "AUTO (Pair rule): " + text
             if r.get("auto") == "cross":
                 text = f"BEP cross {r['trig_time']}: {r['opt']} closed {r['trig_close']:.2f} above BEP"
             if r["status"] == "failed" and r.get("fail_why"):

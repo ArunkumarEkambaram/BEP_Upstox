@@ -812,7 +812,7 @@ def section(title, icon, rows, empty_text, place, name):
             bg = {"triggered": "bg-green-10 text-green-2", "failed": "bg-red-10 text-red-2"}.get(r["status"], "")
             src = f"\u2b50 {r['trig_time']}" if r.get("source") == "star" else "Manual"
             level = manual_type(r) if r.get("source") == "manual" else f"{r['price']:g}"
-            cells = [src, str(r["strike"]), r["opt"], level, f"{r['tf']} min" + (" · LTP" if r.get("trig_on") == "ltp" else ""),
+            cells = [src, str(r["strike"]), r["opt"], level, CommonWatch.tf_label(r) + (" · LTP" if r.get("trig_on") == "ltp" else ""),
                      (f"{r['last_close']:.2f} ({r['last_time']})" if r["last_close"] is not None else "--"),
                      CommonWatch.status_text(r)]
             for txt in cells:
@@ -999,7 +999,7 @@ def pair_section(rows, place, name):
             lc = r["legs"]["CE"].get("last_close"), r["legs"]["PE"].get("last_close")
             closes = " \u00b7 ".join(f"{v:.2f}" if v is not None else "--" for v in lc)
             for txt in (CommonWatch.pair_title(r), f"{r['buffer']:g}",
-                        f"{r['tf']} min" + (" · LTP" if r.get("trig_on") == "ltp" else ""), closes, CommonWatch.status_text(r)):
+                        CommonWatch.tf_label(r) + (" · LTP" if r.get("trig_on") == "ltp" else ""), closes, CommonWatch.status_text(r)):
                 ui.label(txt).classes(f"text-sm px-2 py-1 rounded {bg}")
             order_type_cell(name, r)
             sl_tgt_cell(name, r)
@@ -1384,7 +1384,8 @@ def edit_dialog(name, r):
         buffer = ui.number("Buffer", value=r.get("buffer"), min=0, step=0.05).classes("w-full")
         pe_price.set_visibility(pair)
         buffer.set_visibility(pair)
-        tf = ui.radio({1: "1 min", 3: "3 min", 5: "5 min"}, value=r["tf"]).props("inline dense")
+        tf = ui.radio(TF_PAIR if pair else {1: "1 min", 3: "3 min", 5: "5 min"},
+                      value=f"{r['tf_sec']}s" if r.get("tf_sec") else r["tf"]).props("inline dense")
         trig = trig_toggle(r.get("trig_on") or "close")
         ui.label("Saving restarts the check from the candles before the row was added (arming starts again)."
                  ).classes("text-xs opacity-70")
@@ -1400,7 +1401,8 @@ def edit_dialog(name, r):
             if p <= 0 or pp <= 0 or (b is not None and b < 0):
                 ui.notify("Prices above 0; buffer 0 or more.", type="negative")
                 return
-            if engine.edit_watch(name, r["id"], int(tf.value), p, pp, b, trig.value):
+            tf_min, tf_sec = tf_split(tf.value)
+            if engine.edit_watch(name, r["id"], tf_min, p, pp, b, trig.value, tf_sec):
                 dlg.close()
             else:
                 ui.notify("Only a WAITING row can be edited.", type="warning")
@@ -1724,7 +1726,7 @@ def order_card(name, r, place, live, note=None):
                 ui.badge("Buy").props("color=green-9 text-color=green-2")
                 ui.badge("INTRADAY").props("color=grey-8")
                 if r.get("source") != "manual":
-                    ui.badge(f"{r['tf']} min").props("color=grey-8")
+                    ui.badge(CommonWatch.tf_label(r)).props("color=grey-8")
                 if r.get("source") == "star":
                     ui.badge(f"\u2b50 {r.get('trig_time', '')}").props("color=amber-9")
                 if r.get("source") == "manual":
@@ -1742,16 +1744,15 @@ def order_card(name, r, place, live, note=None):
                 if r.get("auto") == "cross":
                     ui.badge(f"BEP cross {r.get('trig_time', '')}").props("color=teal-8") \
                         .tooltip("Added automatically by BEP Support > BEP Pair cross (prices = BEPs, buffer 0)")
-                if r.get("trig_how") == "auto":
-                    ui.badge(f"AUTO {r.get('trig_time', '')}").props("color=deep-orange-8") \
-                        .tooltip(f"Ordered by itself: {r.get('opt')} LTP crossed above its price (Auto at "
-                                 f"{config.PAIR_AUTO_FROM[:5]})")
+                if r.get("trig_how") == "auto" or r.get("auto_fire"):
+                    how = (f" \u00b7 {r.get('auto_tf')} close" if r.get("auto_how") == "close" else
+                           " \u00b7 Pair rule" if r.get("auto_fire") else " \u00b7 LTP")
+                    ui.badge(f"AUTO {r.get('trig_time', '')}{how}").props("color=deep-orange-8") \
+                        .tooltip("Ordered by itself: " + CommonWatch.auto_why(r))
                 elif r.get("kind") == "pair" and r.get("auto") != "cross" and r["status"] == "watching":
-                    ui.switch(f"Auto at {config.PAIR_AUTO_FROM[:5]}", value=bool(r.get("auto_open")),
+                    ui.switch("Auto order", value=bool(r.get("auto_open")),
                               on_change=lambda e, rid=r["id"]: engine.set_watch_auto(name, rid, e.value)) \
-                        .props("dense color=deep-orange").classes("text-xs") \
-                        .tooltip(f"{config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}: the first leg whose live LTP "
-                                 "crosses above its price is ordered by itself (no ⚡, no popups).")
+                        .props("dense color=deep-orange").classes("text-xs").tooltip(f"Auto order: {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg that was at or below its price and then (Trigger on) Candle close: its candle closes above it / Live LTP: its LTP crosses above it (no opponent check). After {config.PAIR_AUTO_TO[:5]} until 15:15: the normal Pair rule (opponent below price - buffer) places the order by itself. No ⚡, no popups.")
             with ui.row().classes("items-center gap-2 no-wrap"):
                 chip = ui.badge(state).props(f"color={_chip_colour(state)}").classes("text-sm px-2 py-1")
                 if order is not None and (engine.is_open(order) or str(order.get("sq") or "").startswith("FAILED")) \
@@ -1841,7 +1842,7 @@ def order_card(name, r, place, live, note=None):
                         with ui.row().classes("items-center gap-2 no-wrap"):
                             ui.label(f"{o} {r[o.lower() + '_price']:.2f}").classes("text-base font-bold whitespace-nowrap")
                             gap_row.append(ui.label("").classes("text-xs font-bold whitespace-nowrap"))
-                    ui.label(f"{r['opt']} closed above · {r['tf']} min · buffer {r['buffer']:g}").classes("text-xs opacity-60")
+                    ui.label(f"{r['opt']} closed above · {CommonWatch.tf_label(r)} · buffer {r['buffer']:g}").classes("text-xs opacity-60")
             else:
                 with card_box(level_name(r)):
                     with ui.row().classes("items-center gap-1 no-wrap"):
@@ -1856,7 +1857,7 @@ def order_card(name, r, place, live, note=None):
                             ui.label(f"{(r['ce_price'] if r.get('kind') == 'pair' else r['price']):.2f}") \
                                 .classes("text-lg font-bold")
                         ui.icon("arrow_upward").classes("text-sm")
-                    ui.label(("LTP above (live)" if r.get("trig_on") == "ltp" else "close above") + f" · {r['tf']} min"
+                    ui.label(("LTP above (live)" if r.get("trig_on") == "ltp" else "close above") + f" · {CommonWatch.tf_label(r)}"
                              + (f" · buffer {r['buffer']:g}" if r.get("kind") == "pair" else "")).classes("text-xs opacity-60")
             card_rule_box(name, r, "tgt", locked)
             card_rule_box(name, r, "sl", locked)
@@ -1946,8 +1947,8 @@ def om_header(title, help_text):
             OM_VIEW["compact"] = bool(ev.value)
             engine.bump("watch")                          # redraw the lists in the new view
         sw.on_value_change(flip)
-    ui.label(help_text + (" Only Pair rows with Auto at 09:15 place by themselves; everything else waits for ⚡ Place order."
-                          if "Auto at 09:15" in help_text else " Nothing is placed automatically: use ⚡ Place order.")).classes("text-xs opacity-70")
+    ui.label(help_text + (" Only Pair rows with Auto order place by themselves; everything else waits for ⚡ Place order."
+                          if "Auto order" in help_text else " Nothing is placed automatically: use ⚡ Place order.")).classes("text-xs opacity-70")
 
 
 def sl_warning(rule, ref, ref_name) -> str:
@@ -2157,10 +2158,24 @@ def om_list(name, title, icon, draw):
     ui.timer(1.0, tick)
 
 
-def tf_radio():
+TF_PAIR = {"15s": "15 s", "30s": "30 s", 1: "1 min", 3: "3 min", 5: "5 min"}
+
+
+def tf_radio(pair=False):
     with ui.column().classes("gap-0"):
         ui.label("Timeframe").classes("text-xs opacity-70")
-        return ui.radio({1: "1 min", 3: "3 min", 5: "5 min"}, value=5).props("inline dense")
+        r = ui.radio(TF_PAIR if pair else {1: "1 min", 3: "3 min", 5: "5 min"}, value=5).props("inline dense")
+        if pair:
+            r.tooltip("15 s / 30 s: candles built by the app from the live LTP (Upstox has none), used by Auto order "
+                      f"in {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}; after that the row uses 1 min candles.")
+        return r
+
+
+def tf_split(v):
+    """Radio value -> (tf minutes, tf_sec or None): "15s" -> (1, 15)."""
+    if isinstance(v, str) and v.endswith("s"):
+        return 1, int(v[:-1])
+    return int(v), None
 
 
 def form_ltp(name, legs):
@@ -2260,8 +2275,8 @@ def pair_star_page():
               "window (level = BEP) and turn red when the BEP Support board row fails. Pair entry: a leg closes above its price while the opponent closes below price − "
               "buffer (the leg must have been at or below its price first). After you order, the opponent closing "
               "back at or above that line squares off the position (live) or records the exit (dry run). "
-              f"Auto at 09:15 (switch): {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg whose live LTP crosses above its price is ORDERED "
-              f"BY ITSELF (no opponent check); after {config.PAIR_AUTO_TO[:5]} with no cross the row is a normal Pair.")
+              f"Auto order (switch): {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg whose candle closes (or, with Live LTP, LTP crosses) above its price is ORDERED "
+              f"BY ITSELF (no opponent check); after {config.PAIR_AUTO_TO[:5]} until 15:15 the normal Pair rule places it by itself.")
     for name in engine.active():
         step = config.INDEXES[name]["strike_interval"]
         with ui.card().classes("w-full"):
@@ -2276,13 +2291,10 @@ def pair_star_page():
                 p_pe.on("blur", ltp_refresh)
                 p_buffer = ui.number("Buffer (opponent below price − buffer)", value=1, min=0, step=0.05) \
                     .classes("w-64")
-                tf = tf_radio()
+                tf = tf_radio(pair=True)
                 trig = trig_toggle()
                 omode = order_mode_toggle()
-                auto_sw = ui.switch(f"Auto at {config.PAIR_AUTO_FROM[:5]}", value=False) \
-                    .tooltip(f"{config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}: the first leg whose live LTP "
-                             "crosses above its price (at or below it first) is ORDERED BY ITSELF, no opponent check. "
-                             f"After {config.PAIR_AUTO_TO[:5]} with no cross: a normal Pair row (alert + ⚡).")
+                auto_sw = ui.switch("Auto order", value=False).tooltip(f"Auto order: {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg that was at or below its price and then (Trigger on) Candle close: its candle closes above it / Live LTP: its LTP crosses above it (no opponent check). After {config.PAIR_AUTO_TO[:5]} until 15:15: the normal Pair rule (opponent below price - buffer) places the order by itself. No ⚡, no popups.")
 
                 def add(name=name, step=step, p_ce=p_ce, p_pe=p_pe, p_price=p_price, p_pe_price=p_pe_price,
                         p_buffer=p_buffer, tf=tf, omode=omode, trig=trig, auto_sw=auto_sw):
@@ -2298,11 +2310,11 @@ def pair_star_page():
                                   type="negative")
                         return
                     om = omode.value if omode.value != "strategy" else None
-                    engine.add_pair(name, ce, pe, price, pe_price, buffer, int(tf.value), om, trig.value,
-                                    bool(auto_sw.value))
+                    tf_min, tf_sec = tf_split(tf.value)
+                    engine.add_pair(name, ce, pe, price, pe_price, buffer, tf_min, om, trig.value,
+                                    bool(auto_sw.value), tf_sec)
                     ui.notify(f"Watching pair {ce}CE / {pe}PE at {price:g}, "
-                              + (f"AUTO order at {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}, "
-                                 if auto_sw.value else "")
+                              + ("AUTO ORDER ON, " if auto_sw.value else "")
                               + ("STOP-LIMIT order at the fired leg's price." if om == "stoplimit" else
                                  "LIMIT order at the fired leg's price." if om else "strategy order."), type="positive")
                 ui.button("Add", icon="add", on_click=add)
@@ -2388,7 +2400,7 @@ def pairstar_section(rows, place, name, notes, empty_text):
                 lc = r["legs"]["CE"].get("last_close"), r["legs"]["PE"].get("last_close")
                 closes = " \u00b7 ".join(f"{v:.2f}" if v is not None else "--" for v in lc)
             status = CommonWatch.status_text(r) + (f" \u00b7 {notes[r['id']]}" if r["id"] in notes else "")
-            for txt in (typ, what, f"{r['tf']} min" + (" \u00b7 LTP" if r.get("trig_on") == "ltp" else ""),
+            for txt in (typ, what, CommonWatch.tf_label(r) + (" \u00b7 LTP" if r.get("trig_on") == "ltp" else ""),
                         closes, status):
                 ui.label(txt).classes(f"text-sm px-2 py-1 rounded {bg}")
             order_type_cell(name, r)
