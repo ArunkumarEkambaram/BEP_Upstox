@@ -2013,8 +2013,12 @@ def make_place(name):
             thr = float(cfg.get("warn_above_bep", 10) or 0)          # far above BEP (PR #43)
             bep_v = await engine.row_bep(name, r) if thr > 0 else None
             if bep_v is not None:
-                if ltp is not None and ltp - bep_v > thr:
-                    warns.append(f"LTP {ltp:.2f} is {ltp - bep_v:.2f} points above BEP {bep_v:.2f} (warning above "
+                # check the price the order buys at (user, 26 Nov): a Limit / Stop-limit its limit price (below),
+                # a Strategy card with an Entry Price that price, a plain Strategy (market) card the LTP
+                ep = trade_tracker._f(r.get("entry_price")) if not limit else None
+                buy, what = (ep, "Entry price") if ep is not None else (ltp, "LTP")
+                if not limit and buy is not None and buy - bep_v > thr:
+                    warns.append(f"{what} {buy:.2f} is {buy - bep_v:.2f} points above BEP {bep_v:.2f} (warning above "
                                  f"{thr:g}): late entry, bigger risk to the SL.")
                 if limit and lp and lp - bep_v > thr:
                     warns.append(f"{'Stop-limit' if engine.is_stop(r) else 'Limit'} price {lp:.2f} is "
