@@ -2013,7 +2013,8 @@ def make_place(name):
             thr = float(cfg.get("warn_above_bep", 10) or 0)          # far above BEP (PR #43)
             bep_v = await engine.row_bep(name, r) if thr > 0 else None
             if bep_v is not None:
-                if ltp is not None and ltp - bep_v > thr:
+                # a Limit / Stop-limit buys at its limit price, not at the LTP: check only that (user, 26 Nov)
+                if not limit and ltp is not None and ltp - bep_v > thr:
                     warns.append(f"LTP {ltp:.2f} is {ltp - bep_v:.2f} points above BEP {bep_v:.2f} (warning above "
                                  f"{thr:g}): late entry, bigger risk to the SL.")
                 if limit and lp and lp - bep_v > thr:
