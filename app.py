@@ -2933,6 +2933,16 @@ def order_defaults_card(name):
             # ---- 09:15 opening order
             with setup_section("09:15 opening order", "alarm", "flex-1 min-w-[320px] max-w-[calc(50%-0.5rem)]"):
                 ui.label("Target = the Default order Target value.").classes("text-xs opacity-70")
+                today = datetime.now(market_utils.IST).strftime("%Y-%m-%d")
+                with ui.row().classes("w-full items-center gap-4"):
+                    ad_open_on = ui.switch("09:15 BEP order", value=bool(ad_cfg.get("open_order_on", False)),
+                                           on_change=lambda e, n=name: engine.set_opening_order(n, e.value)) \
+                        .tooltip("ON: the automatic 09:15 BEP order is placed. OFF (default): no 09:15 order; the plan "
+                                 "and the signals still show on the Dashboard / Log. Saved at once.")
+                    ad_skip_today = ui.checkbox("No trade today", value=ad_cfg.get("open_skip_date") == today,
+                                                on_change=lambda e, n=name: engine.set_skip_today(n, e.value)) \
+                        .tooltip("Skip only today's 09:15 BEP order; it resets by itself tomorrow. Saved at once.")
+                    ad_skip_today.bind_enabled_from(ad_open_on, "value")
                 ad_max_above = ui.number("Max points above BEP (skip at or above)",
                                          value=ad_cfg.get("max_above_bep", 15), min=0, step=1).classes("w-full")
                 with ui.row().classes("w-full gap-2 no-wrap"):

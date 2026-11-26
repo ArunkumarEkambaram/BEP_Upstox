@@ -113,6 +113,8 @@ def _default_auto_order() -> dict:
         "open_max_sl": 17,
         # The 09:15 order's own trailing SL (independent of the Default order trail): once the high reaches
         # entry + trigger, the exchange SL moves to high - gap in steps of point, never down
+        "open_order_on": False,          # Setup > 09:15 opening order: place the automatic 09:15 BEP order (user, 26 Nov)
+        "open_skip_date": "",            # "No trade today": skip only that day's 09:15 order (YYYY-MM-DD)
         "open_trail": True, "open_trail_trigger": 20, "open_trail_point": 1, "open_trail_gap": 19,
         # BEP Upstox PR 3: a card whose SL is CANDLE only also gets an exchange SL this many points below the
         # fill (a fall inside a candle, or the app down); 0 = none
