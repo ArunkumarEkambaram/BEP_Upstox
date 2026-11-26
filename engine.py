@@ -618,12 +618,14 @@ class Engine:
         return ok
 
     def add_pair(self, name, ce_strike, pe_strike, ce_price, pe_price, buffer, tf, mode=None, trig_on="close",
-                 auto_open=False):
+                 auto_open=False, tf_sec=None):
         r = self.watches[name].add_pair(ce_strike, pe_strike, ce_price, pe_price, buffer, tf, _now(), mode, trig_on,
-                                        auto_open)
-        self.log(f"{name} Order Management: pair added {CommonWatch.pair_title(r)}, buffer {buffer:g}, {tf} min, "
+                                        auto_open, tf_sec)
+        self.log(f"{name} Order Management: pair added {CommonWatch.pair_title(r)}, buffer {buffer:g}, "
+                 f"{CommonWatch.tf_label(r)}, "
                  f"trigger on {'live LTP' if trig_on == 'ltp' else 'candle close'}"
-                 + (f", AUTO at {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}" if auto_open else "")
+                 + (f", AUTO ORDER (window {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}, then the Pair rule "
+                    "until 15:15)" if auto_open else "")
                  + (", STOP-LIMIT order." if mode == "stoplimit" else ", LIMIT order." if mode == "limit" else ", strategy order."))
         self.bump("watch")
 
@@ -639,8 +641,7 @@ class Engine:
         ok = self.watches[name].set_auto(row_id, on)
         if ok:
             r = self.watches[name].get(row_id)
-            self.log(f"{name} Pair {CommonWatch.pair_title(r)}: Auto at {config.PAIR_AUTO_FROM[:5]} "
-                     + ("ON" if on else "OFF") + ".")
+            self.log(f"{name} Pair {CommonWatch.pair_title(r)}: Auto order " + ("ON" if on else "OFF") + ".")
             self.bump("watch")
         return ok
 
@@ -654,6 +655,9 @@ class Engine:
         if not r or r["status"] != "triggered" or r.get("order_status") in ORDER_LOCKED + ("PENDING",):
             return None
         head = f"{name} AUTO ORDER Pair {CommonWatch.pair_title(r)}: {r['strike']}{r['opt']}"
+        if _now().time() >= exit_rules.EXIT_TIME:         # no new automatic orders from 15:15
+            self.log(f"{head} NOT placed - after {exit_rules.EXIT_TIME.strftime('%H:%M')}; the card stays TRIGGERED.")
+            return None
         ltp = self.row_live_ltp(name, r)
 
         def skip(why):
@@ -680,19 +684,18 @@ class Engine:
             trigger = self.stop_prices(r)[0]
             if trigger and ltp is not None and ltp >= trigger:
                 return skip(f"Stop-limit trigger {trigger:.2f} is already at or below the LTP {ltp:.2f}")
-            self.log(f"{head}: crossed above {r['price']:g} (LTP {ltp}) - sending the "
+            self.log(f"{head}: {CommonWatch.auto_why(r)} (LTP {ltp}) - sending the "
                      + ("stop-limit" if trigger else "limit") + " order.")
             res = await self.place_limit_order(name, row_id)
         elif r.get("entry_price"):
             ok, msg = self.arm_watch_entry(name, row_id)
-            self.log(f"{head}: crossed above {r['price']:g} - entry price armed: {msg}")
+            self.log(f"{head}: {CommonWatch.auto_why(r)} - entry price armed: {msg}")
             self.notify(f"{head}: entry {'armed' if ok else 'NOT armed'} - {msg}", "positive" if ok else "negative",
                         f"{name} auto order")
             return None
         else:
             res = await self.place_watch_order(name, row_id, fill_ltp=ltp,
-                                               entry_note=f"Auto at {config.PAIR_AUTO_FROM[:5]}: LTP {ltp} crossed "
-                                                          f"above {r['price']:g}")
+                                               entry_note=f"Auto order: {CommonWatch.auto_why(r)}, LTP {ltp}")
         if res:
             st = ORDER_STATUS.get(res["status"], res["status"].upper())
             self.log(f"{head}: {st}.")
@@ -768,13 +771,13 @@ class Engine:
             self.bump("watch")
         return ok
 
-    def edit_watch(self, name, row_id, tf, price, pe_price=None, buffer=None, trig_on=None) -> bool:
-        ok = self.watches[name].edit(row_id, tf, price, pe_price, buffer, trig_on)
+    def edit_watch(self, name, row_id, tf, price, pe_price=None, buffer=None, trig_on=None, tf_sec=None) -> bool:
+        ok = self.watches[name].edit(row_id, tf, price, pe_price, buffer, trig_on, tf_sec)
         if ok:
             r = self.watches[name].get(row_id)
             what = CommonWatch.pair_title(r) + f", buffer {r['buffer']:g}" if r.get("kind") == "pair" else \
                 f"{r['strike']}{r['opt']} @ {r['price']:g}"
-            self.log(f"{name} Order Management row {row_id} edited: {what} ({tf} min).")
+            self.log(f"{name} Order Management row {row_id} edited: {what} ({CommonWatch.tf_label(r)}).")
             self.bump("watch")
         return ok
 
@@ -996,18 +999,22 @@ class Engine:
         for name in self.active():
             fired, changed = self.watches[name].live_step(
                 lambda strike, opt, name=name: self.option_ltp.get((name, int(strike), opt)), now)
-            auto = [r for r in fired if r.get("trig_how") == "auto"]
-            fired = [r for r in fired if r.get("trig_how") != "auto"]
+            auto = [r for r in fired if r.get("trig_how") == "auto" or r.get("auto_fire")]
+            fired = [r for r in fired if r not in auto]
             for r in fired:
                 self.log("COMMON PRICE (live LTP): " + notifier.common_label(r))
             if fired and not config.ALERTS_PAUSED:
                 self.notify("\n".join(notifier.common_short(r) for r in fired), "positive", f"{name} Order Management")
             if changed:
                 self.bump("watch")
-            for r in auto:                             # Pair "Auto at 09:15": order at once
-                self.log(f"{name} AUTO Pair {CommonWatch.pair_title(r)}: {r['opt']} LTP {r['trig_close']:.2f} crossed "
-                         f"above {r['price']:g} at {r['trig_time']} (opponent LTP {r.get('trig_opp')}).")
-                await self.auto_place(name, r["id"])
+            await self._auto_fired(name, auto)
+
+    async def _auto_fired(self, name, rows):
+        """Pair rows with "Auto order" ON that just triggered (window rule or Pair rule): order at once."""
+        for r in rows:
+            self.log(f"{name} AUTO Pair {CommonWatch.pair_title(r)}: {CommonWatch.auto_why(r)} at {r['trig_time']} "
+                     f"(opponent {r.get('trig_opp')}).")
+            await self.auto_place(name, r["id"])
 
     async def option_tick(self):
         await self.refresh_option_ltps()
@@ -1269,6 +1276,8 @@ class Engine:
                     now = _now()
                     before = [(r["id"], r["status"], r["last_time"]) for r in self.watches[name].rows]
                     fired = await run.io_bound(self.watches[name].step, self.client, mon.expiry, now)
+                    auto_rows = [r for r in fired if r.get("trig_how") == "auto" or r.get("auto_fire")]
+                    fired = [r for r in fired if r not in auto_rows]
                     for r in fired:
                         self.log("COMMON PRICE: " + notifier.common_label(r))
                     if fired:
@@ -1280,6 +1289,7 @@ class Engine:
                     after = [(r["id"], r["status"], r["last_time"]) for r in self.watches[name].rows]
                     if star_added or star_failed or cross_added or cross_failed or fired or before != after:
                         self.bump("watch")
+                    await self._auto_fired(name, auto_rows)         # "Auto order" Pair rows: order at once
 
                     await self.handle_pair_exits(name)
                     await self.cancel_dead_limits(name)
