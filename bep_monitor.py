@@ -56,6 +56,7 @@ class BepMonitor:
         self.plan = None             # 09:15 opening plan, prepared before the open (see prepare_opening)
         self._plan_skip_logged = None
         self._far_logged = set()     # (date, strike, opt) already logged as "too far above BEP"
+        self._off_signal = {}        # (date, opt) -> 09:15 signal seen while the 09:15 order is OFF / skipped today
         self.new_orders = []         # signals waiting to be sent
         self.replay = False          # True = a past day rebuilt from historical candles: no alerts, no quotes
         self.bep_fn = None
@@ -160,8 +161,24 @@ class BepMonitor:
         elif key in self.side_lock:
             self.side_lock[key]["status"] = status
 
+    def opening_off(self, day: str):
+        """Why the automatic 09:15 BEP order is not placed today (None = it is): the Setup switch is OFF, or
+        "No trade today" was ticked for this day (user, 26 Nov). The plan and the signals still run."""
+        cfg = config.AUTO_ORDER.get(self.name, {})
+        if not cfg.get("open_order_on", False):
+            return "09:15 order OFF (Setup)"
+        if cfg.get("open_skip_date") == day:
+            return "No trade today"
+        return None
+
     def side_status_text(self, day: str = None) -> str:
         day = day or datetime.now(market_utils.IST).strftime("%Y-%m-%d")
+        off = self.opening_off(day)
+        if off:
+            sig = [f"{o}: {s['strike']} signal at {s['time']}, not ordered" for o in ("CE", "PE")
+                   for s in [self._off_signal.get((day, o))] if s]
+            return f"09:15 order: {'OFF (Setup)' if 'OFF' in off else 'skipped today (No trade today)'}" \
+                + (" \u2014 " + " \u00b7 ".join(sig) if sig else "")
         names = {"dry_run": "DRY RUN", "sent": "SENT", "failed": "FAILED", "queued": "sending"}
         parts = []
         for opt in ("CE", "PE"):
@@ -305,6 +322,14 @@ class BepMonitor:
             if not cands:
                 continue
             _dist, strike, level, ltp = min(cands)
+            off = self.opening_off(day)
+            if off:                                          # 09:15 order OFF / skipped today: show, don't order
+                if (day, opt) not in self._off_signal:
+                    self._off_signal[(day, opt)] = {"time": now.strftime("%H:%M:%S"), "strike": strike, "ltp": ltp,
+                                                    "why": off}
+                    log_fn(f"BEP {self.name} opening candle: {opt} {strike} 09:15 signal (LTP {ltp:.2f}, BEP "
+                           f"{level:.2f}) - NOT ordered ({off})")
+                continue
             if self._queue_order(opt, strike, level, ltp, now):
                 others = ", ".join(str(c[1]) for c in sorted(cands) if c[1] != strike)
                 cfg = config.AUTO_ORDER.get(self.name, {})
