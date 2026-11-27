@@ -19,10 +19,9 @@ TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upstox_to
 SANDBOX_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_token.json")
 _BROKER_KEYS = ("market_protection", "algo_name")
 _AUTO_KEYS = ("tgt", "sl", "tgt_type", "sl_type", "qty", "trail", "candle_max_sl",
-              "trail_type", "trail_trigger", "trail_point", "trail_gap", "max_above_bep",
-              "tgt_same", "tgt_pair", "tgt_star", "tgt_manual", "open_entry_above", "open_sl_below", "open_sl_tf", "open_max_sl",
-              "open_trail", "open_trail_trigger", "open_trail_point", "open_trail_gap",
-              "warn_above_bep", "max_loss_day", "open_order_on", "open_skip_date")
+              "trail_type", "trail_trigger", "trail_point", "trail_gap",
+              "tgt_same", "tgt_pair", "tgt_star", "tgt_manual",
+              "warn_above_bep", "max_loss_day")
 
 
 def load() -> str:
