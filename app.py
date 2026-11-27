@@ -1104,6 +1104,19 @@ def card_ltp_text(name, r) -> str:
     return f"{v:.2f}" if v is not None else "--"
 
 
+def opp_text(name, r):
+    """Fired Pair card: the opponent leg, its live LTP and the line its candle close must stay below (else the
+    opponent exit / FAILED). Returns (text, past_line) or None."""
+    ol = CommonWatch.opp_leg(r)
+    if not ol or r["status"] not in ("triggered",):
+        return None
+    opp, strike, line = ol
+    v = engine.option_ltp.get((name, strike, opp))
+    gap = f" ({v - line:+.2f})" if v is not None else ""
+    return (f"Opp {strike}{opp} {v:.2f}" if v is not None else f"Opp {strike}{opp} --") \
+        + f" \u00b7 exit if a {r['tf']} min close \u2265 {line:.2f}" + gap, v is not None and v >= line
+
+
 def cross_bep_gaps(name, r):
     """BEP cross Pair card: live LTP minus BEP for the CE and the PE leg (None until an LTP arrives)."""
     lt = engine.option_ltp
@@ -1732,7 +1745,8 @@ def order_card(name, r, place, live, note=None):
                 if r.get("source") == "manual":
                     ui.badge("Manual entry").props("color=indigo-7")
                 if r.get("kind") == "pair" and r.get("opt"):
-                    ui.badge(f"{r['opt']} fired").props("color=grey-8") \
+                    ol = CommonWatch.opp_leg(r)
+                    ui.badge(f"{r['opt']} fired" + (f" \u00b7 opp {ol[1]}{ol[0]}" if ol else "")).props("color=grey-8") \
                         .tooltip(f"{CommonWatch.pair_title(r)} \u00b7 the other leg is still watched for the "
                                  "opponent rule (FAILED before \u26a1, opponent SL after)")
                 if r.get("kind") == "pair" and r.get("auto") != "cross":
@@ -1824,6 +1838,8 @@ def order_card(name, r, place, live, note=None):
                 pts_lbl = ui.label("").classes("text-xs opacity-70")
             with card_box("LTP"):
                 ltp_lbl = ui.label("--").classes("text-lg font-bold whitespace-pre-line text-center leading-tight")
+                opp_lbl = ui.label("").classes("text-xs text-center leading-tight")
+                opp_lbl.set_visibility(CommonWatch.opp_leg(r) is not None and r["status"] == "triggered")
             gap_row = None
             if r.get("source") == "manual":
                 with card_box(level_name(r)):
@@ -1880,6 +1896,10 @@ def order_card(name, r, place, live, note=None):
     def refresh():
         o = engine.row_order(r)
         ltp_lbl.set_text(card_ltp_text(name, r).replace(" · ", "\n"))   # pair: CE and PE on two lines
+        ot = opp_text(name, r)
+        if ot:
+            opp_lbl.set_text(ot[0])
+            opp_lbl.classes(replace="text-xs text-center leading-tight " + ("text-red-4" if ot[1] else "opacity-70"))
         if gap_row is not None:
             gaps = [g for g in cross_bep_gaps(name, r) if not r.get("opt") or g[0] == r["opt"]]
             for lbl, (opt, gap) in zip(gap_row, gaps):
