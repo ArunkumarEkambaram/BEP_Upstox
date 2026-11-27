@@ -108,7 +108,7 @@ def _default_auto_order() -> dict:
         "max_loss_day": 2000,
         # default targets per Order Management type
         # each row can override value and type until it is ordered
-        "tgt_same": 50, "tgt_pair": 50, "tgt_star": 50, "tgt_manual": 50,
+        "tgt_pair": 50, "tgt_star": 50, "tgt_manual": 50,
         "trail": False, "trail_type": "LTP", "trail_trigger": 20, "trail_point": 1, "trail_gap": 19,
     }
 

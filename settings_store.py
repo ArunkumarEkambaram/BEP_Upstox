@@ -20,7 +20,7 @@ SANDBOX_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "s
 _BROKER_KEYS = ("market_protection", "algo_name")
 _AUTO_KEYS = ("tgt", "sl", "tgt_type", "sl_type", "qty", "trail", "candle_max_sl",
               "trail_type", "trail_trigger", "trail_point", "trail_gap",
-              "tgt_same", "tgt_pair", "tgt_star", "tgt_manual",
+              "tgt_pair", "tgt_star", "tgt_manual",
               "warn_above_bep", "max_loss_day")
 
 
