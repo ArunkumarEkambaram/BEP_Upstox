@@ -595,8 +595,8 @@ class Engine:
         self.log(f"{name} Order Management: pair added {CommonWatch.pair_title(r)}, buffer {buffer:g}, "
                  f"{CommonWatch.tf_label(r)}, "
                  f"trigger on {'live LTP' if trig_on == 'ltp' else 'candle close'}"
-                 + (f", AUTO ORDER (window {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}, then the Pair rule "
-                    "until 15:15)" if auto_open else "")
+                 + (f", AUTO ORDER (09:15 rule from the open, then the Pair rule {config.PAIR_AUTO_TO[:5]}-15:15)"
+                    if auto_open else "")
                  + (", STOP-LIMIT order." if mode == "stoplimit" else ", LIMIT order." if mode == "limit" else ", strategy order."))
         self.bump("watch")
 
@@ -960,6 +960,7 @@ class Engine:
         to Trigger on live LTP (alert + Place order ready, like a candle trigger)."""
         now = _now()
         for name in self.active():
+            await self._pair_opens(name, now)
             fired, changed = self.watches[name].live_step(
                 lambda strike, opt, name=name: self.option_ltp.get((name, int(strike), opt)), now)
             auto = [r for r in fired if r.get("trig_how") == "auto" or r.get("auto_fire")]
@@ -971,6 +972,35 @@ class Engine:
             if changed:
                 self.bump("watch")
             await self._auto_fired(name, auto)
+
+    async def _pair_opens(self, name, now):
+        """09:15 Pair Auto order rule: the legs' 09:15 open (Upstox OHLC, one call for every row still without it)
+        sets each row's stance. Until it is known the row waits; after 10 s the first LTP is used instead."""
+        cw, mon = self.watches[name], self.monitors[name]
+        rows = [r for r in cw.rows if cw.auto_active(r, now) and not (r.get("op") or {}).get("opens")]
+        if not rows or not self.client or not mon.expiry:
+            return
+        mapping, _err = await run.io_bound(market_utils.option_instrument_keys, self.client, mon.expiry,
+                                           config.INDEXES[name]["underlying_key"])
+        if not mapping:
+            return
+        keys = {r["id"]: {"CE": mapping.get(r["ce_strike"], {}).get("CE"), "PE": mapping.get(r["pe_strike"], {}).get("PE")}
+                for r in rows}
+        data, err = await run.io_bound(self.client.fetch_ohlc, sorted({k for v in keys.values() for k in v.values() if k}))
+        if not data:
+            return
+        changed = False
+        for r in rows:
+            opens = {o: (data.get(keys[r["id"]][o]) or {}).get("open") for o in ("CE", "PE")}
+            if all(isinstance(v, (int, float)) and v > 0 for v in opens.values()) and cw.set_opens(r, opens, "09:15 open"):
+                op = r["op"]
+                self.log(f"{name} AUTO Pair {CommonWatch.pair_title(r)}: 09:15 open CE {opens['CE']:.2f} / PE "
+                         f"{opens['PE']:.2f} -> " + (op.get("done") or (f"{op['stance']} opened above its price"
+                                                     if op["case"] == "A" else "both at / below their price")) + ".")
+                changed = True
+        if changed:
+            cw.save()
+            self.bump("watch")
 
     async def _auto_fired(self, name, rows):
         """Pair rows with "Auto order" ON that just triggered (window rule or Pair rule): order at once."""

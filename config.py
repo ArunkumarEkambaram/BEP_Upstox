@@ -40,6 +40,8 @@ STOP_LIMIT_GAP = 1.0              # Manual Stop-limit: default limit price = tri
 
 PAIR_AUTO_FROM = "09:15:00"        # Pair "Auto at 09:15": active from (incl.) ...
 PAIR_AUTO_TO = "09:30:00"          # ... until (excl.); after it the row is a normal Pair (alert + ⚡)
+PAIR_OPEN_B_END = "09:20:00"      # 09:15 rule, both legs opened below: a close above must come by this time
+PAIR_OPEN_WAIT_MIN = 5            # 09:15 rule, a leg opened above but too far: wait this long for the LTP
 
 # Live scan interval (seconds).
 SCAN_INTERVAL_SECONDS = 10
@@ -103,6 +105,7 @@ def _default_auto_order() -> dict:
         # ⚡ on a BEP card (⭐ / BEP cross Pair / Manual Entry): "Check before placing" when the LTP (or the limit
         # price) is more than this many points above the strike's BEP (PR #43; 0 = off)
         "warn_above_bep": 10,
+        "pair_open_max": 10,          # 09:15 Pair Auto order: LTP at most this many points above the price (0 = no limit)
         # Max loss per day (₹, 0 = off; DRY RUN orders only for now): once today's closed + open P&L of the
         # dry-run orders is a loss of this much, ⚡ asks first and a PENDING card that fires later is not placed.
         "max_loss_day": 2000,

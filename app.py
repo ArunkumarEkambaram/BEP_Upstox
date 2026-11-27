@@ -144,6 +144,14 @@ def when_changed(keys, fn, interval: float = 1.0):
     ui.timer(interval, tick)
 
 
+AUTO_TIP = (f"Auto order. 09:15 rule (from the legs' 09:15 open): a leg that OPENED above its price is ordered at its "
+            f"first timeframe close above, when the LTP is within the Setup max (10 pts) of the price; further above "
+            f"it waits up to {config.PAIR_OPEN_WAIT_MIN} min for the LTP to come within it. Both opened below: the "
+            f"first leg whose timeframe candle closes above by {config.PAIR_OPEN_B_END[:5]} (LTP within the max). "
+            f"Both opened above: no 09:15 order. After {config.PAIR_AUTO_TO[:5]} until 15:15: the normal Pair rule "
+            f"(opponent below price - buffer) places the order by itself. No \u26a1, no popups.")
+
+
 def om_rows(kind, name=None):
     """Order Management rows of one kind ("same" / "pair" / "star" / "manual"; "pairstar" = Pair + ⭐) for one index, or for all active ones."""
     out = []
@@ -1721,14 +1729,16 @@ def order_card(name, r, place, live, note=None):
                     ui.badge(f"BEP cross {r.get('trig_time', '')}").props("color=teal-8") \
                         .tooltip("Added automatically by BEP Support > BEP Pair cross (prices = BEPs, buffer 0)")
                 if r.get("trig_how") == "auto" or r.get("auto_fire"):
-                    how = (f" \u00b7 {r.get('auto_tf')} close" if r.get("auto_how") == "close" else
+                    how = (" \u00b7 opened above" if r.get("auto_how") == "opened" else
+                           " \u00b7 near price" if r.get("auto_how") == "near" else
+                           f" \u00b7 {r.get('auto_tf')} close" if r.get("auto_how") == "close" else
                            " \u00b7 Pair rule" if r.get("auto_fire") else " \u00b7 LTP")
                     ui.badge(f"AUTO {r.get('trig_time', '')}{how}").props("color=deep-orange-8") \
                         .tooltip("Ordered by itself: " + CommonWatch.auto_why(r))
                 elif r.get("kind") == "pair" and r.get("auto") != "cross" and r["status"] == "watching":
                     ui.switch("Auto order", value=bool(r.get("auto_open")),
                               on_change=lambda e, rid=r["id"]: engine.set_watch_auto(name, rid, e.value)) \
-                        .props("dense color=deep-orange").classes("text-xs").tooltip(f"Auto order: {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg that was at or below its price and then (Trigger on) Candle close: its candle closes above it / Live LTP: its LTP crosses above it (no opponent check). After {config.PAIR_AUTO_TO[:5]} until 15:15: the normal Pair rule (opponent below price - buffer) places the order by itself. No ⚡, no popups.")
+                        .props("dense color=deep-orange").classes("text-xs").tooltip(AUTO_TIP)
             with ui.row().classes("items-center gap-2 no-wrap"):
                 chip = ui.badge(state).props(f"color={_chip_colour(state)}").classes("text-sm px-2 py-1")
                 if order is not None and (engine.is_open(order) or str(order.get("sq") or "").startswith("FAILED")) \
@@ -2209,8 +2219,10 @@ def pair_star_page():
               "window (level = BEP) and turn red when the BEP Support board row fails. Pair entry: a leg closes above its price while the opponent closes below price − "
               "buffer (the leg must have been at or below its price first). After you order, the opponent closing "
               "back at or above that line squares off the position (live) or records the exit (dry run). "
-              f"Auto order (switch): {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg whose candle closes (or, with Live LTP, LTP crosses) above its price is ORDERED "
-              f"BY ITSELF (no opponent check); after {config.PAIR_AUTO_TO[:5]} until 15:15 the normal Pair rule places it by itself.")
+              f"Auto order (switch), 09:15 rule from the legs' open: a leg that OPENED above its price is ORDERED BY "
+              f"ITSELF at its first timeframe close above (LTP within the Setup max, else up to {config.PAIR_OPEN_WAIT_MIN} "
+              f"min wait); both opened below = the first close above by {config.PAIR_OPEN_B_END[:5]}; both above = no "
+              f"09:15 order. After {config.PAIR_AUTO_TO[:5]} until 15:15 the normal Pair rule places it by itself.")
     for name in engine.active():
         step = config.INDEXES[name]["strike_interval"]
         with ui.card().classes("w-full"):
@@ -2228,7 +2240,7 @@ def pair_star_page():
                 tf = tf_radio(pair=True)
                 trig = trig_toggle()
                 omode = order_mode_toggle()
-                auto_sw = ui.switch("Auto order", value=False).tooltip(f"Auto order: {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} the first leg that was at or below its price and then (Trigger on) Candle close: its candle closes above it / Live LTP: its LTP crosses above it (no opponent check). After {config.PAIR_AUTO_TO[:5]} until 15:15: the normal Pair rule (opponent below price - buffer) places the order by itself. No ⚡, no popups.")
+                auto_sw = ui.switch("Auto order", value=False).tooltip(AUTO_TIP)
 
                 def add(name=name, step=step, p_ce=p_ce, p_pe=p_pe, p_price=p_price, p_pe_price=p_pe_price,
                         p_buffer=p_buffer, tf=tf, omode=omode, trig=trig, auto_sw=auto_sw):
@@ -2959,6 +2971,11 @@ def order_defaults_card(name):
                                         value=ad_cfg.get("warn_above_bep", 10), min=0, step=1).classes("w-full") \
                     .tooltip("BEP Support \u2b50, BEP cross Pair and Manual Entry cards: 'Check before placing' "
                              "shows the LTP - BEP difference")
+                ad_pair_open = ui.number("09:15 Pair Auto order: max points above the price (0 = no limit)",
+                                         value=ad_cfg.get("pair_open_max", 10), min=0, step=1).classes("w-full") \
+                    .tooltip("09:15 rule of Pair cards with Auto order ON: the order goes only while the LTP is at "
+                             f"most this many points above the leg's price (a leg that opened above waits up to "
+                             f"{config.PAIR_OPEN_WAIT_MIN} min for it)")
                 ad_max_loss = ui.number("Max loss per day ₹ (0 = off)",
                                         value=ad_cfg.get("max_loss_day", 2000), min=0, step=100).classes("w-full") \
                     .tooltip("Today's closed + open P&L of the Dry run orders. Once the loss reaches this: \u26a1 / "
@@ -2986,6 +3003,9 @@ def order_defaults_card(name):
         warn_bep = num(ad_warn_bep.value)
         if warn_bep is None or warn_bep < 0:
             return None, "Warn above BEP must be a number of 0 or more (0 = off)."
+        pair_open = num(ad_pair_open.value)
+        if pair_open is None or pair_open < 0:
+            return None, "09:15 Pair max points must be a number of 0 or more (0 = no limit)."
         max_loss = num(ad_max_loss.value)
         if max_loss is None or max_loss < 0:
             return None, "Max loss per day must be a number of 0 or more (0 = off)."
@@ -3001,6 +3021,7 @@ def order_defaults_card(name):
                 return None, "Gap must not be larger than Trigger (Gap = Trigger moves the SL to cost at the trigger)."
         return {"tgt": tgt, "sl": sl, "qty": int(qty), "tgt_type": ad_tgt_type.value, "sl_type": ad_sl_type.value,
                 "trail": trail, **defaults, "candle_max_sl": candle_max, "warn_above_bep": warn_bep,
+                "pair_open_max": pair_open,
                 "max_loss_day": max_loss,
                 "trail_trigger": t_trig if t_trig is not None else ad_cfg.get("trail_trigger", 20),
                 "trail_point": t_point if t_point is not None else ad_cfg.get("trail_point", 1),
