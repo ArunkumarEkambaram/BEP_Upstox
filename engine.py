@@ -1092,7 +1092,10 @@ class Engine:
         for ev in cw.pop_exits():
             row = next((o for o in self.order_log if o["id"] == ev.get("order_id")), None)
             opp = "PE" if ev["opt"] == "CE" else "CE"
-            why = f"opponent {opp} closed {ev['opp_close']:.2f} at {ev['fail_time']}"
+            ol = CommonWatch.opp_leg(ev)
+            why = (f"opponent {ol[1]}{ol[0]} closed {ev['opp_close']:.2f} at / above its line {ol[2]:.2f}, "
+                   f"{CommonWatch.candle_span(ev, ev['fail_time'])}" if ol else
+                   f"opponent {opp} closed {ev['opp_close']:.2f} at {ev['fail_time']}")
             if row is None:
                 continue
             already = isinstance(row.get("exit"), (int, float)) or trade_tracker._f(row.get("exit")) is not None \

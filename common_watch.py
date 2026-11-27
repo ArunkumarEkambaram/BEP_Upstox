@@ -646,6 +646,26 @@ class CommonWatch:
         return fired, changed
 
     @staticmethod
+    def candle_span(r, label) -> str:
+        """ "09:20-09:25 candle" for a candle labelled by its END time (the app's labels) - TradingView labels the
+        same candle 09:20 (its start)."""
+        try:
+            h, m = (int(x) for x in str(label).split(":")[:2])
+        except (TypeError, ValueError):
+            return str(label)
+        tf = int(r.get("tf") or 5)
+        start = h * 60 + m - tf
+        return f"{start // 60:02d}:{start % 60:02d}\u2013{label} candle"
+
+    @staticmethod
+    def opp_leg(r):
+        """(opt, strike, line) of a fired Pair row's opponent: the line its close must stay below (price - buffer)."""
+        if r.get("kind") != "pair" or not r.get("opt"):
+            return None
+        opp = "PE" if r["opt"] == "CE" else "CE"
+        return opp, int(r[opp.lower() + "_strike"]), round(float(r[opp.lower() + "_price"]) - float(r.get("buffer") or 0), 2)
+
+    @staticmethod
     def armed_text(r) -> str:
         """e.g. "armed" / "CE armed" / "not armed yet" for a WAITING row."""
         if r.get("kind") == "pair":
@@ -700,12 +720,17 @@ class CommonWatch:
                 text = "AUTO (Pair rule): " + text
             if r.get("auto") == "cross":
                 text = f"BEP cross {r['trig_time']}: {r['opt']} closed {r['trig_close']:.2f} above BEP"
+            ol = CommonWatch.opp_leg(r)
+            oname = f"{ol[1]}{ol[0]}" if ol else opp
+            oline = f" (line {ol[2]:.2f})" if ol else ""
             if r["status"] == "failed" and r.get("fail_why"):
                 text += f" \u2192 failed at {r['fail_time']}: {r['fail_why']}"
             elif r["status"] == "failed":
-                text += f" \u2192 failed: {opp} closed {r['fail_close']:.2f} at {r['fail_time']}"
+                text += (f" \u2192 failed: opponent {oname} closed {r['fail_close']:.2f}{oline}, "
+                         f"{CommonWatch.candle_span(r, r['fail_time'])}")
             elif r["status"] == "exited":
-                text += (f" \u2192 opponent SL: {opp} closed {r['opp_close']:.2f} at {r['fail_time']}"
+                text += (f" \u2192 opponent SL: {oname} closed {r['opp_close']:.2f}{oline}, "
+                         f"{CommonWatch.candle_span(r, r['fail_time'])}"
                          + (f"; square-off {r['squareoff']}" if r.get("squareoff") else ""))
             return text
 
