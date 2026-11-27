@@ -600,14 +600,6 @@ class Engine:
                  + (", STOP-LIMIT order." if mode == "stoplimit" else ", LIMIT order." if mode == "limit" else ", strategy order."))
         self.bump("watch")
 
-    def add_watch(self, name, strike, leg, price, tf, mode=None, trig_on="close"):
-        rows = self.watches[name].add(strike, leg, price, tf, _now(), mode, trig_on)
-        self.log(f"{name} common price watch added: "
-                 + ", ".join(f"{r['strike']}{r['opt']} @ {r['price']:g} ({r['tf']} min)" for r in rows)
-                 + f", trigger on {'live LTP' if trig_on == 'ltp' else 'candle close'}"
-                 + (", STOP-LIMIT order." if mode == "stoplimit" else ", LIMIT order." if mode == "limit" else ", strategy order."))
-        self.bump("watch")
-
     def set_watch_auto(self, name, row_id, on) -> bool:
         ok = self.watches[name].set_auto(row_id, on)
         if ok:

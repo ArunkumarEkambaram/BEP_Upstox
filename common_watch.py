@@ -67,8 +67,11 @@ class CommonWatch:
         try:
             with open(_file(self.day), encoding="utf-8") as f:
                 data = json.load(f)
-            self.rows = [r for r in data.get("rows", []) if r.get("index") == self.index]
-            self._seq = max([r["id"] for r in self.rows], default=0)
+            rows = [r for r in data.get("rows", []) if r.get("index") == self.index]
+            self._seq = max([r["id"] for r in rows], default=0)
+            # Same strike was removed (27 Nov): its rows that were not ordered are dropped, so nothing hidden alerts
+            self.rows = [r for r in rows if r.get("source") or r.get("kind") or r.get("order_id")
+                         or r.get("order_status")]
         except (OSError, ValueError):
             pass
 
@@ -92,24 +95,6 @@ class CommonWatch:
             self.load(now)
 
     # ------------------------------------------------------------------ rows
-    def add(self, strike: int, leg: str, price: float, tf: int, now=None, mode: str = None,
-            trig_on: str = "close") -> list:
-        now = now or datetime.now(IST)
-        self._roll_day(now)
-        added = []
-        for opt in (("CE", "PE") if leg == "Both" else (leg,)):
-            self._seq += 1
-            row = {"id": self._seq, "index": self.index, "strike": int(strike), "opt": opt, "price": float(price),
-                   "tf": int(tf), "added_at": now.isoformat(), "status": "watching", "baseline": None,
-                   "last_done": None, "prev_close": None, "last_close": None, "last_time": "",
-                   "trig_time": "", "trig_close": None, "fail_time": "", "fail_close": None, "order_status": "",
-                   "armed": False, "trig_on": "ltp" if trig_on == "ltp" else "close"}
-            self._apply_mode(row, mode)
-            self.rows.append(row)
-            added.append(row)
-        self.save()
-        return added
-
     def add_star(self, ev: dict, now=None):
         """Adds a \u2b50 row from a live BEP Support first-support event. Returns the row, or None if already there."""
         now = now or datetime.now(IST)

@@ -3,7 +3,7 @@ app.py - NiceGUI screens for the BEP Support monitor (single-page app).
 
 Layout: a fixed header (NIFTY LTP, status, connection, Dry run / LIVE, Pause buttons, theme) and a left navigation
 drawer with pages served by ui.sub_pages (no full page reloads):
-  Dashboard . BEP Support . Order Management (group: Same strike . Pair . BEP Support \u2b50) . Order Details
+  Dashboard . BEP Support . Order Management (group: Pair & \u2b50 . Manual Entry) . Order Details
   . Setup (once a day) . Logs
 All trading logic runs once in the background engine (engine.py); pages only read its state and redraw when the
 matching version number changes.
@@ -86,7 +86,6 @@ SUPPORT_RED = ("rgba(239,68,68,0.16)", "#f87171")
 OM_ROOT = "/order-management"
 # Order Management sub-pages: (path, icon, label, row kind). Add a tuple here (and a page builder) for a new one.
 OM_SUB = [
-    (OM_ROOT + "/same-strike", "price_change", "Same strike", "same"),
     (OM_ROOT + "/pair-star", "compare_arrows", "Pair & \u2b50", "pairstar"),   # Pair, BEP cross and \u2b50 cards
     (OM_ROOT + "/manual-entry", "edit_note", "Manual Entry", "manual"),
 ]
@@ -402,11 +401,10 @@ def root():
 
     routes = {path: page(path, b) for path, b in (
         ("/", dashboard_page), (SUPPORT_SUB[0][0], support_page), (SUPPORT_SUB[1][0], pair_cross_page),
-        (OM_SUB[0][0], same_strike_page), (OM_SUB[1][0], pair_star_page), (OM_SUB[2][0], manual_page),
+        (OM_SUB[0][0], pair_star_page), (OM_SUB[1][0], manual_page),
         ("/order-details", orders_page), ("/setup", setup_page), ("/logs", logs_page))}
-    routes[OM_ROOT] = page(OM_SUB[0][0], same_strike_page)        # old link: opens Same strike
-    for old in ("/pair", "/bep-star"):                             # old links: the merged Pair & \u2b50 page
-        routes[OM_ROOT + old] = page(OM_SUB[1][0], pair_star_page)
+    for old in ("", "/pair", "/bep-star", "/same-strike"):        # old links (Same strike was removed): Pair & \u2b50
+        routes[OM_ROOT + old] = page(OM_SUB[0][0], pair_star_page)
     routes[SUPPORT_ROOT] = page(SUPPORT_SUB[0][0], support_page)  # old link: opens the Support board
     ui.sub_pages(routes).classes("w-full")
 
@@ -2205,54 +2203,6 @@ def centre_strike(name):
     return mon.strikes[len(mon.strikes) // 2] if mon.strikes else None
 
 
-def same_strike_page():
-    om_header("Same strike", "Alerts when a leg's candle closes ABOVE the common price (crossing up from at or below), "
-              "once. Red = closed back below after triggering (no alert). Rows added before 09:15 use the first "
-              "candle's open as the previous price.")
-    for name in engine.active():
-        step = config.INDEXES[name]["strike_interval"]
-        with ui.card().classes("w-full"):
-            card_title(f"{name} — add same strike", "add_circle")
-            with ui.row().classes("items-end gap-6"):
-                strike = ui.number("Strike", value=centre_strike(name), step=step, precision=0).classes("w-32")
-                with ui.column().classes("gap-0"):
-                    ui.label("Leg").classes("text-xs opacity-70")
-                    leg = ui.radio(["Both", "CE", "PE"], value="Both").props("inline dense")
-                price = ui.number("Common price", value=None, min=0, step=0.05).classes("w-36")
-                ltp_refresh = form_ltp(name, lambda strike=strike, leg=leg: [
-                    (strike.value, o) for o in (("CE", "PE") if leg.value == "Both" else (leg.value,))])
-                strike.on("blur", ltp_refresh)
-                leg.on_value_change(ltp_refresh)
-                tf = tf_radio()
-                trig = trig_toggle()
-                omode = order_mode_toggle()
-
-                def add(name=name, step=step, strike=strike, leg=leg, price=price, tf=tf, omode=omode, trig=trig):
-                    try:
-                        k, p = int(strike.value), float(price.value)
-                    except (TypeError, ValueError):
-                        ui.notify("Enter a strike and a common price.", type="negative")
-                        return
-                    if k <= 0 or k % step or p <= 0:
-                        ui.notify(f"Strike must be a multiple of {step}; common price above 0.", type="negative")
-                        return
-                    om = omode.value if omode.value != "strategy" else None
-                    engine.add_watch(name, k, leg.value, p, int(tf.value), om, trig.value)
-                    ui.notify(f"Watching {k} {leg.value} at {p:g} ({tf.value} min), "
-                              + (f"STOP-LIMIT order: trigger {p:g}, limit {p + config.STOP_LIMIT_GAP:g}." if om == "stoplimit"
-                                 else f"LIMIT order at {p:g}." if om else "strategy order."), type="positive")
-                ui.button("Add", icon="add", on_click=add)
-
-        def draw(place, live, compact, name=name):
-            rows = om_rows("same", name)
-            if compact:
-                section(f"Same strike ({len(rows)})", "price_change", rows,
-                        "No same-strike rows yet - add one above.", place, name)
-            else:
-                card_list(name, rows, place, live, "No same-strike rows yet - add one above.")
-        om_list(name, "watched strikes", "visibility", draw)
-
-
 def pair_star_page():
     om_header("Pair & \u2b50", "Pair, BEP cross and \u2b50 cards in one list (filter above the cards; "
               "TRIGGERED first). \u2b50 cards are added automatically for a live first support inside the ATM "
@@ -3002,7 +2952,6 @@ def order_defaults_card(name):
                 ui.label("Default target for new rows (each row can be changed until ordered; type follows "
                          "the Default order Target type)").classes("text-xs opacity-70")
                 with ui.row().classes("w-full gap-2 no-wrap"):
-                    ad_tgt_same = ui.number("Same strike", value=ad_cfg.get("tgt_same", ad_cfg["tgt"]), min=0, step=1).classes("flex-1")
                     ad_tgt_pair = ui.number("Pair", value=ad_cfg.get("tgt_pair", ad_cfg["tgt"]), min=0, step=1).classes("flex-1")
                     ad_tgt_star = ui.number("BEP Support \u2b50", value=ad_cfg.get("tgt_star", ad_cfg["tgt"]), min=0, step=1).classes("flex-1")
                     ad_tgt_manual = ui.number("Manual entry", value=ad_cfg.get("tgt_manual", ad_cfg["tgt"]), min=0, step=1).classes("flex-1")
@@ -3030,10 +2979,10 @@ def order_defaults_card(name):
             return None, "Target and SL must be numbers above 0."
         if qty is None or qty < 1 or qty != int(qty):
             return None, "Quantity must be a whole number of at least 1."
-        defaults = {k: num(w.value) for k, w in (("tgt_same", ad_tgt_same), ("tgt_pair", ad_tgt_pair),
+        defaults = {k: num(w.value) for k, w in (("tgt_pair", ad_tgt_pair),
                                                      ("tgt_star", ad_tgt_star), ("tgt_manual", ad_tgt_manual))}
         if any(v is None or v <= 0 for v in defaults.values()):
-            return None, "Default targets (Same strike / Pair / BEP Support / Manual entry) must be numbers above 0."
+            return None, "Default targets (Pair / BEP Support / Manual entry) must be numbers above 0."
         warn_bep = num(ad_warn_bep.value)
         if warn_bep is None or warn_bep < 0:
             return None, "Warn above BEP must be a number of 0 or more (0 = off)."
@@ -3065,8 +3014,7 @@ def order_defaults_card(name):
         saved = engine.save_order_defaults(name, nums)
         trail_txt = (f"trail ON (trigger {nums['trail_trigger']}, point {nums['trail_point']}, gap {nums['trail_gap']})"
                      if nums["trail"] else "trail OFF")
-        ad_status.set_text(f"✅ {saved} Target {nums['tgt']} ({nums['tgt_type']}; rows: same {nums['tgt_same']:g}, "
-                           f"pair {nums['tgt_pair']:g}, \u2b50 {nums['tgt_star']:g}, manual {nums['tgt_manual']:g}), "
+        ad_status.set_text(f"✅ {saved} Target {nums['tgt']} ({nums['tgt_type']}; rows: pair {nums['tgt_pair']:g}, \u2b50 {nums['tgt_star']:g}, manual {nums['tgt_manual']:g}), "
                            f"SL {nums['sl']} ({nums['sl_type']}), qty {nums['qty']}; {trail_txt}; "
                            f"CANDLE-SL cards: max SL {nums['candle_max_sl']:g} pts at the exchange; "
                            + (f"max loss per day ₹{nums['max_loss_day']:,.0f} (Dry run)." if nums['max_loss_day']
