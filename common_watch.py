@@ -198,6 +198,26 @@ class CommonWatch:
         self.save()
         return row, None
 
+    def cross_twin(self, strike, opt, time_str):
+        """A live BEP-cross Pair card whose buy leg is this option (strike + CE/PE) on the same candle, else None.
+        A ⭐ on that option and candle is then not added (the BEP cross card wins)."""
+        return next((r for r in self.rows if r.get("auto") == "cross" and r["status"] != "failed"
+                     and r.get("strike") == int(strike) and r.get("opt") == opt and r.get("trig_time") == time_str),
+                    None)
+
+    def drop_star_twins(self, cross_row) -> list:
+        """Removes ⭐ cards on the BEP-cross card's buy leg (same strike, CE/PE and candle) that are not ordered
+        yet (no order sent, no armed entry). Ordered ⭐ cards stay. Returns the removed rows."""
+        gone = [r for r in self.rows if r.get("source") == "star" and r["status"] == "triggered"
+                and r.get("strike") == cross_row.get("strike") and r.get("opt") == cross_row.get("opt")
+                and r.get("trig_time") == cross_row.get("trig_time")
+                and not r.get("order_status") and not r.get("order_id")]
+        if gone:
+            ids = {r["id"] for r in gone}
+            self.rows = [r for r in self.rows if r["id"] not in ids]
+            self.save()
+        return gone
+
     def sync_cross_failures(self, cross_rows: list) -> bool:
         """Marks BEP-cross Pair rows that are not ordered yet FAILED when their pair-cross table row failed."""
         by_id = {c["id"]: c for c in cross_rows}
