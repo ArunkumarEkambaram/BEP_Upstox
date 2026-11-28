@@ -995,7 +995,7 @@ def pair_section(rows, place, name):
             lc = r["legs"]["CE"].get("last_close"), r["legs"]["PE"].get("last_close")
             closes = " \u00b7 ".join(f"{v:.2f}" if v is not None else "--" for v in lc)
             for txt in (CommonWatch.pair_title(r), f"{r['buffer']:g}",
-                        CommonWatch.tf_label(r) + (" · LTP" if r.get("trig_on") == "ltp" else ""), closes, CommonWatch.status_text(r)):
+                        CommonWatch.tf_badge(r) + (" · LTP" if r.get("trig_on") == "ltp" else ""), closes, CommonWatch.status_text(r)):
                 ui.label(txt).classes(f"text-sm px-2 py-1 rounded {bg}")
             order_type_cell(name, r)
             sl_tgt_cell(name, r)
@@ -1367,8 +1367,11 @@ def edit_dialog(name, r):
         buffer = ui.number("Buffer", value=r.get("buffer"), min=0, step=0.05).classes("w-full")
         pe_price.set_visibility(pair)
         buffer.set_visibility(pair)
-        tf = ui.radio(TF_PAIR if pair else {1: "1 min", 3: "3 min", 5: "5 min"},
-                      value=f"{r['tf_sec']}s" if r.get("tf_sec") else r["tf"]).props("inline dense")
+        auto_on = bool(r.get("auto_open")) and r.get("auto") != "cross"
+        tf = tf_radio(pair, auto_on, f"{r['tf_sec']}s" if r.get("tf_sec") else r["tf"])
+        if pair and r.get("tf_sec") and not CommonWatch.sec_tf_ok(auto_on):
+            ui.label(f"{r['tf_sec']} s works only with Auto order ON before {config.PAIR_AUTO_TO[:5]}: "
+                     "1 min is selected.").classes("text-xs text-amber-5")
         trig = trig_toggle(r.get("trig_on") or "close")
         ui.label("Saving restarts the check from the candles before the row was added (arming starts again)."
                  ).classes("text-xs opacity-70")
@@ -1384,7 +1387,7 @@ def edit_dialog(name, r):
             if p <= 0 or pp <= 0 or (b is not None and b < 0):
                 ui.notify("Prices above 0; buffer 0 or more.", type="negative")
                 return
-            tf_min, tf_sec = tf_split(tf.value)
+            tf_min, tf_sec = tf_split(tf.value, auto_on)
             if engine.edit_watch(name, r["id"], tf_min, p, pp, b, trig.value, tf_sec):
                 dlg.close()
             else:
@@ -1709,7 +1712,7 @@ def order_card(name, r, place, live, note=None):
                 ui.badge("Buy").props("color=green-9 text-color=green-2")
                 ui.badge("INTRADAY").props("color=grey-8")
                 if r.get("source") != "manual":
-                    ui.badge(CommonWatch.tf_label(r)).props("color=grey-8")
+                    ui.badge(CommonWatch.tf_badge(r)).props("color=grey-8").tooltip(TF_TIP)
                 if r.get("source") == "star":
                     ui.badge(f"\u2b50 {r.get('trig_time', '')}").props("color=amber-9")
                 if r.get("source") == "manual":
@@ -1830,7 +1833,7 @@ def order_card(name, r, place, live, note=None):
                         with ui.row().classes("items-center gap-2 no-wrap"):
                             ui.label(f"{o} {r[o.lower() + '_price']:.2f}").classes("text-base font-bold whitespace-nowrap")
                             gap_row.append(ui.label("").classes("text-xs font-bold whitespace-nowrap"))
-                    ui.label(f"{r['opt']} closed above · {CommonWatch.tf_label(r)} · buffer {r['buffer']:g}").classes("text-xs opacity-60")
+                    ui.label(f"{r['opt']} closed above · {CommonWatch.tf_badge(r)} · buffer {r['buffer']:g}").classes("text-xs opacity-60")
             else:
                 with card_box(level_name(r)):
                     with ui.row().classes("items-center gap-1 no-wrap"):
@@ -1845,7 +1848,7 @@ def order_card(name, r, place, live, note=None):
                             ui.label(f"{(r['ce_price'] if r.get('kind') == 'pair' else r['price']):.2f}") \
                                 .classes("text-lg font-bold")
                         ui.icon("arrow_upward").classes("text-sm")
-                    ui.label(("LTP above (live)" if r.get("trig_on") == "ltp" else "close above") + f" · {CommonWatch.tf_label(r)}"
+                    ui.label(("LTP above (live)" if r.get("trig_on") == "ltp" else "close above") + f" · {CommonWatch.tf_badge(r)}"
                              + (f" · buffer {r['buffer']:g}" if r.get("kind") == "pair" else "")).classes("text-xs opacity-60")
             card_rule_box(name, r, "tgt", locked)
             card_rule_box(name, r, "sl", locked)
@@ -2150,23 +2153,47 @@ def om_list(name, title, icon, draw):
     ui.timer(1.0, tick)
 
 
-TF_PAIR = {"15s": "15 s", "30s": "30 s", 1: "1 min", 3: "3 min", 5: "5 min"}
+TF_MIN = {1: "1 min", 3: "3 min", 5: "5 min"}
+TF_PAIR = {"10s": "10 s", "15s": "15 s", "30s": "30 s", **TF_MIN}
+TF_TIP = (f"10 s / 15 s / 30 s only for Auto order, {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]} "
+          f"(candles built by the app from the live LTP every 2 s); after {config.PAIR_AUTO_TO[:5]} the card uses 1 min.")
 
 
-def tf_radio(pair=False):
+def tf_radio(pair=False, auto_on=False, value=5):
+    """Timeframe radio. Pair: 10 s / 15 s / 30 s are offered only while they can work (Auto order ON, before
+    09:30); sync_tf keeps that up to date."""
     with ui.column().classes("gap-0"):
         ui.label("Timeframe").classes("text-xs opacity-70")
-        r = ui.radio(TF_PAIR if pair else {1: "1 min", 3: "3 min", 5: "5 min"}, value=5).props("inline dense")
+        ok = pair and CommonWatch.sec_tf_ok(auto_on)
+        if isinstance(value, str) and not ok:
+            value = 1
+        r = ui.radio(TF_PAIR if ok else TF_MIN, value=value).props("inline dense")
         if pair:
-            r.tooltip("15 s / 30 s: candles built by the app from the live LTP (Upstox has none), used by Auto order "
-                      f"in {config.PAIR_AUTO_FROM[:5]}-{config.PAIR_AUTO_TO[:5]}; after that the row uses 1 min candles.")
+            r.tooltip(TF_TIP)
         return r
 
 
-def tf_split(v):
-    """Radio value -> (tf minutes, tf_sec or None): "15s" -> (1, 15)."""
+def sync_tf(radio, auto_on, quiet=False):
+    """Shows / hides 10 s / 15 s / 30 s on a Pair timeframe radio. A selected seconds timeframe that can't work
+    any more (Auto order OFF, or 09:30 passed) becomes 1 min, with a short note."""
+    ok = CommonWatch.sec_tf_ok(auto_on)
+    opts = TF_PAIR if ok else TF_MIN
+    if list(radio.options) == list(opts):
+        return
+    v = radio.value
+    if isinstance(v, str) and not ok:
+        v = 1
+        if not quiet:
+            ui.notify(f"{radio.value[:-1]} s works only with Auto order ON before {config.PAIR_AUTO_TO[:5]}: "
+                      "timeframe set to 1 min.", type="info")
+    radio.set_options(opts, value=v)
+
+
+def tf_split(v, auto_on=True):
+    """Radio value -> (tf minutes, tf_sec or None): "15s" -> (1, 15). A seconds value that can't work
+    (auto_on False, or after 09:30) -> (1, None)."""
     if isinstance(v, str) and v.endswith("s"):
-        return 1, int(v[:-1])
+        return (1, int(v[:-1])) if CommonWatch.sec_tf_ok(auto_on) else (1, None)
     return int(v), None
 
 
@@ -2241,6 +2268,8 @@ def pair_star_page():
                 trig = trig_toggle()
                 omode = order_mode_toggle()
                 auto_sw = ui.switch("Auto order", value=False).tooltip(AUTO_TIP)
+                auto_sw.on_value_change(lambda e, tf=tf: sync_tf(tf, e.value))
+                ui.timer(15, lambda tf=tf, auto_sw=auto_sw: sync_tf(tf, auto_sw.value))   # 09:30 passes
 
                 def add(name=name, step=step, p_ce=p_ce, p_pe=p_pe, p_price=p_price, p_pe_price=p_pe_price,
                         p_buffer=p_buffer, tf=tf, omode=omode, trig=trig, auto_sw=auto_sw):
@@ -2256,7 +2285,7 @@ def pair_star_page():
                                   type="negative")
                         return
                     om = omode.value if omode.value != "strategy" else None
-                    tf_min, tf_sec = tf_split(tf.value)
+                    tf_min, tf_sec = tf_split(tf.value, auto_sw.value)
                     engine.add_pair(name, ce, pe, price, pe_price, buffer, tf_min, om, trig.value,
                                     bool(auto_sw.value), tf_sec)
                     ui.notify(f"Watching pair {ce}CE / {pe}PE at {price:g}, "
@@ -2346,7 +2375,7 @@ def pairstar_section(rows, place, name, notes, empty_text):
                 lc = r["legs"]["CE"].get("last_close"), r["legs"]["PE"].get("last_close")
                 closes = " \u00b7 ".join(f"{v:.2f}" if v is not None else "--" for v in lc)
             status = CommonWatch.status_text(r) + (f" \u00b7 {notes[r['id']]}" if r["id"] in notes else "")
-            for txt in (typ, what, CommonWatch.tf_label(r) + (" \u00b7 LTP" if r.get("trig_on") == "ltp" else ""),
+            for txt in (typ, what, CommonWatch.tf_badge(r) + (" \u00b7 LTP" if r.get("trig_on") == "ltp" else ""),
                         closes, status):
                 ui.label(txt).classes(f"text-sm px-2 py-1 rounded {bg}")
             order_type_cell(name, r)
