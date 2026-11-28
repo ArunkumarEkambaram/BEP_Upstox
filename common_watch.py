@@ -236,7 +236,7 @@ class CommonWatch:
                "opp_close": None, "exit_close": None, "order_status": "", "order_id": None, "squareoff": "",
                "trig_on": "ltp" if trig_on == "ltp" else "close",
                "auto_open": bool(auto_open)}         # "Auto order": placed by itself (window rule, then Pair rule)
-        if tf_sec in (15, 30):                    # 15 s / 30 s: app-built candles in the auto window, 1 min after
+        if tf_sec in self.SEC_TFS:                # 10 / 15 / 30 s: app-built candles in the auto window, 1 min after
             row.update(tf=1, tf_sec=int(tf_sec))
         self._apply_mode(row, mode)
         self.rows.append(row)
@@ -254,10 +254,31 @@ class CommonWatch:
         return bool(r.get("auto_open")) and r.get("kind") == "pair" and r.get("auto") != "cross" \
             and r["status"] == "watching" and CommonWatch.auto_window(now)
 
+    SEC_TFS = (10, 15, 30)    # seconds timeframes: app-built candles, only for Auto order in 09:15-09:30
+
     @staticmethod
     def tf_label(r) -> str:
-        """"15 s" / "30 s" (app-built candles in the auto window) or "5 min"."""
+        """"10 s" / "15 s" / "30 s" (app-built candles in the auto window) or "5 min"."""
         return f"{r['tf_sec']} s" if r.get("tf_sec") else f"{r['tf']} min"
+
+    @staticmethod
+    def sec_tf_ok(auto_on, now=None) -> bool:
+        """10 s / 15 s / 30 s can work only with Auto order ON and before PAIR_AUTO_TO (09:30) today."""
+        t = (now or datetime.now(IST)).astimezone(IST).strftime("%H:%M:%S")
+        return bool(auto_on) and t < config.PAIR_AUTO_TO
+
+    @staticmethod
+    def tf_badge(r, now=None) -> str:
+        """The timeframe the card really uses now: a seconds row shows "1 min" with Auto order OFF and
+        "1 min (15 s until 09:30)" after 09:30 (Pair rule on 1 min candles); else tf_label."""
+        if not r.get("tf_sec"):
+            return CommonWatch.tf_label(r)
+        if not (r.get("auto_open") and r.get("kind") == "pair" and r.get("auto") != "cross"):
+            return "1 min"
+        t = (now or datetime.now(IST)).astimezone(IST).strftime("%H:%M:%S")
+        if t >= config.PAIR_AUTO_TO:
+            return f"1 min ({r['tf_sec']} s until {config.PAIR_AUTO_TO[:5]})"
+        return CommonWatch.tf_label(r)
 
     @staticmethod
     def _hms(now, hms):
@@ -399,7 +420,7 @@ class CommonWatch:
         return None, changed
 
     def _sec_candles(self, r, lt, price, now, label) -> tuple:
-        """15 s / 30 s candles built from the live LTP (Upstox has none) for an "Auto order" Pair row on Candle
+        """10 s / 15 s / 30 s candles built from the live LTP (Upstox has none) for an "Auto order" Pair row on Candle
         close, 09:15-09:30. A candle closes at its end: close = the last LTP read inside it. Each close goes to the 09:15
         opening rule (_open_close). A candle the app did not see from its start (start / restart mid-candle) is skipped.
         Returns (fired copy or None, changed)."""
@@ -518,7 +539,7 @@ class CommonWatch:
         if r.get("kind") == "pair":
             r.pop("sc", None)
             r.pop("op", None)                           # the 09:15 stance is worked out again with the new prices
-            if tf_sec in (15, 30):
+            if tf_sec in CommonWatch.SEC_TFS:
                 r.update(tf=1, tf_sec=int(tf_sec))
             else:
                 r.pop("tf_sec", None)
